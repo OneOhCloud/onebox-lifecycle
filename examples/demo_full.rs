@@ -31,9 +31,11 @@ use onebox_lifecycle::{Sentinel, SystemEvent};
 static LOG_FILE: OnceLock<Mutex<File>> = OnceLock::new();
 
 /// Open (or create) the log file in append mode.
-/// Path: ~/onebox_lifecycle_demo.log  — survives reboots.
+/// Path: <current working directory>/onebox_lifecycle_demo.log
 fn init_log_file() -> std::path::PathBuf {
-    let path = dirs_home().join("onebox_lifecycle_demo.log");
+    let path = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("onebox_lifecycle_demo.log");
     let file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -41,14 +43,6 @@ fn init_log_file() -> std::path::PathBuf {
         .expect("cannot open log file");
     LOG_FILE.set(Mutex::new(file)).ok();
     path
-}
-
-/// Resolve the user's home directory without pulling in extra crates.
-fn dirs_home() -> std::path::PathBuf {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
 // ─── Logging helpers ─────────────────────────────────────────────────────────
