@@ -18,30 +18,88 @@
 //!   • Trigger shutdown/restart to see ShuttingDown + 5-second async cleanup
 //!   • Press Ctrl+C to exit normally
 
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use onebox_lifecycle::{Sentinel, SystemEvent};
 
+// ─── Global log file (append, O_SYNC-equivalent via explicit flush) ───────────
+
+static LOG_FILE: OnceLock<Mutex<File>> = OnceLock::new();
+
+/// Open (or create) the log file in append mode.
+/// Path: ~/onebox_lifecycle_demo.log  — survives reboots.
+fn init_log_file() -> std::path::PathBuf {
+    let path = dirs_home().join("onebox_lifecycle_demo.log");
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .expect("cannot open log file");
+    LOG_FILE.set(Mutex::new(file)).ok();
+    path
+}
+
+/// Resolve the user's home directory without pulling in extra crates.
+fn dirs_home() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
 // ─── Logging helpers ─────────────────────────────────────────────────────────
 
-fn hms() -> String {
+fn timestamp() -> String {
+    // Full ISO-8601-ish timestamp so the log file is unambiguous across reboots.
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let s = (ms / 1000) % 86400;
+    let total_s = ms / 1000;
+    // Days since epoch → calendar date (Gregorian, good for ~year 9999)
+    let (y, mo, d) = days_to_ymd((total_s / 86400) as u32);
+    let s = total_s % 86400;
     let h = s / 3600;
     let m = (s % 3600) / 60;
     let sec = s % 60;
     let frac = ms % 1000;
-    format!("{h:02}:{m:02}:{sec:02}.{frac:03}")
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{sec:02}.{frac:03}")
+}
+
+/// Tomohiko Sakamoto's algorithm — days since Unix epoch → (year, month, day).
+fn days_to_ymd(days: u32) -> (u32, u32, u32) {
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z % 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    (y, mo, d)
+}
+
+/// Write one log line to both stdout and the log file (flushed immediately).
+fn emit(tag: &str, msg: &str) {
+    let line = format!("[{}] [{:<8}] {}\n", timestamp(), tag, msg);
+    print!("{line}");
+    if let Some(mutex) = LOG_FILE.get() {
+        if let Ok(mut f) = mutex.lock() {
+            let _ = f.write_all(line.as_bytes());
+            let _ = f.flush(); // ensure the line survives a sudden power-off
+        }
+    }
 }
 
 macro_rules! log {
     ($tag:expr, $($arg:tt)*) => {
-        println!("[{}] [{:<8}] {}", hms(), $tag, format!($($arg)*))
+        emit($tag, &format!($($arg)*))
     };
 }
 
@@ -98,12 +156,16 @@ fn main() {
     // Counter shared between event loop and async tasks.
     let event_counter: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
+    // ── Log file ──────────────────────────────────────────────────────────────
+    let log_path = init_log_file();
+
     // ── Banner ────────────────────────────────────────────────────────────────
     let sep = "─".repeat(64);
     println!("{sep}");
     println!("  onebox_lifecycle — full demo");
     println!("  Platform : {}", platform());
     println!("  PID      : {}", std::process::id());
+    println!("  Log file : {}", log_path.display());
     println!("{sep}");
     println!("  Triggers to try:");
     println!("    • Sleep / wake the machine       → WillSleep / DidWake");
@@ -112,6 +174,12 @@ fn main() {
     println!("    • Ctrl-C                         → exit immediately");
     println!("{sep}");
     println!();
+
+    // Write a session-start marker so multiple runs are clearly separated.
+    emit("SESSION", &format!(
+        "════ NEW SESSION  pid={}  platform={}  log={} ════",
+        std::process::id(), platform(), log_path.display()
+    ));
 
     log!("INIT", "Starting Sentinel …");
 
