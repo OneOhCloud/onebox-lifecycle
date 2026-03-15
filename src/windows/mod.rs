@@ -31,10 +31,9 @@ use windows::{
             Threading::SetProcessShutdownParameters,
         },
         UI::WindowsAndMessaging::{
-            CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
-            DispatchMessageW, GetMessageW, HMENU, HWND_MESSAGE, MSG, PostMessageW,
-            RegisterClassExW, TranslateMessage, UnregisterClassW, WINDOW_EX_STYLE, WM_APP,
-            WM_POWERBROADCAST, WM_QUERYENDSESSION, WNDCLASSEXW, WS_OVERLAPPED,
+            CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
+            HMENU, MSG, PostMessageW, RegisterClassExW, TranslateMessage, UnregisterClassW, WM_APP,
+            WM_POWERBROADCAST, WM_QUERYENDSESSION, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
         },
     },
     core::{PCWSTR, w},
@@ -108,15 +107,15 @@ unsafe fn run_message_loop(event_tx: EventSender) {
         let state_ptr = Box::into_raw(state); // freed in WM_DESTROY
 
         let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
+            WS_EX_TOOLWINDOW, // hidden from taskbar and Alt+Tab
             CLASS_NAME,
             w!("SysSentinel"),
-            WS_OVERLAPPED,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            WS_POPUP, // no caption or border; zero-size, never shown
             0,
             0,
-            Some(HWND_MESSAGE), // message-only window — never shown
+            0,
+            0,
+            None, // top-level window — receives WM_POWERBROADCAST & WM_QUERYENDSESSION
             Some(HMENU::default()),
             None,
             Some(state_ptr as *const _),
@@ -310,18 +309,34 @@ unsafe extern "system" fn net_change_callback(
 
 fn network_is_reachable() -> bool {
     use windows::Win32::NetworkManagement::IpHelper::{
-        FreeMibTable, GetIpInterfaceTable, MIB_IPINTERFACE_TABLE,
+        FreeMibTable, GetIfEntry2, GetIpInterfaceTable, MIB_IF_ROW2, MIB_IPINTERFACE_TABLE,
     };
     use windows::Win32::Networking::WinSock::AF_INET;
+
+    // IF_TYPE_SOFTWARE_LOOPBACK = 24 (from ipifcons.h); always present, not a real network.
+    const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
+    // IF_OPER_STATUS: IfOperStatusUp = 1
+    const OPER_STATUS_UP: i32 = 1;
 
     unsafe {
         let mut table: *mut MIB_IPINTERFACE_TABLE = std::ptr::null_mut();
         if GetIpInterfaceTable(AF_INET, &mut table).is_ok() {
-            let count = (*table).NumEntries;
+            let num = (*table).NumEntries as usize;
+            let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), num);
+            let reachable = rows.iter().any(|row| {
+                let mut if_row = MIB_IF_ROW2 {
+                    InterfaceLuid: row.InterfaceLuid,
+                    ..Default::default()
+                };
+                GetIfEntry2(&mut if_row).is_ok()
+                    && if_row.Type != IF_TYPE_SOFTWARE_LOOPBACK
+                    && if_row.OperStatus.0 == OPER_STATUS_UP
+            });
             FreeMibTable(table as *mut _);
-            return count > 0;
+            reachable
+        } else {
+            false
         }
-        false
     }
 }
 
@@ -335,7 +350,6 @@ fn network_is_reachable() -> bool {
 /// and the next [`ShutdownHandle::allow`] call will return `TRUE`.
 ///
 /// Equivalent to `[NSApp replyToApplicationShouldTerminate: YES]` on macOS.
-
 #[allow(dead_code)]
 pub fn post_allow_shutdown(hwnd: HWND) {
     unsafe {
