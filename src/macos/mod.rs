@@ -336,40 +336,19 @@ impl MacosGuard {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Post `[NSApp replyToApplicationShouldTerminate: proceed]` on the main thread.
+/// Post `[NSApp replyToApplicationShouldTerminate: proceed]`.
 ///
-/// Safe to call from any thread — uses `dispatch_async(main_queue, …)`.
+/// For CLI apps the main thread runs no NSRunLoop, so dispatching to the main
+/// GCD queue would deadlock (the block never executes).  We call directly from
+/// the background thread instead — AppKit accepts this for non-GUI processes.
 fn reply_to_should_terminate(proceed: bool) {
-    dispatch_to_main(move || unsafe {
-        // SAFETY: we are on the main thread, dispatched by GCD.
+    // SAFETY: MainThreadMarker::new_unchecked() bypasses the compile-time thread
+    // check.  For a CLI process with no AppKit event loop this is safe because
+    // `replyToApplicationShouldTerminate:` only posts a Mach message internally
+    // and has no UI side-effects that require the main thread.
+    unsafe {
         let mtm = MainThreadMarker::new_unchecked();
         let app = NSApplication::sharedApplication(mtm);
         let _: () = msg_send![&*app, replyToApplicationShouldTerminate: proceed];
-    });
-}
-
-/// Dispatch a `FnOnce` closure to the GCD main queue.
-///
-/// Uses `Mutex<Option<F>>` because `RcBlock` requires `Fn`, not `FnOnce`.
-fn dispatch_to_main<F: FnOnce() + Send + 'static>(f: F) {
-    let cell = Mutex::new(Some(f));
-    let block = RcBlock::new(move || {
-        if let Some(f) = cell.lock().unwrap().take() {
-            f();
-        }
-    });
-
-    // `dispatch_get_main_queue()` is a C macro that expands to `&_dispatch_main_q`,
-    // so we must reference the underlying global directly — there is no callable
-    // function symbol by that name.
-    unsafe extern "C" {
-        // The global dispatch_queue_s that backs the main queue.
-        static _dispatch_main_q: std::ffi::c_void;
-        fn dispatch_async(queue: *const std::ffi::c_void, block: *const std::ffi::c_void);
-    }
-
-    unsafe {
-        let queue = &raw const _dispatch_main_q;
-        dispatch_async(queue, RcBlock::as_ptr(&block) as *const _);
     }
 }

@@ -120,4 +120,28 @@ impl Sentinel {
     pub fn try_recv(&self) -> Option<SystemEvent> {
         self.rx.try_recv()
     }
+
+    /// Consume the sentinel and return only the [`EventReceiver`], which is
+    /// `Send` and can be moved to any background thread.
+    ///
+    /// On **macOS** the platform guard (NSWorkspace observers + NWPathMonitor +
+    /// NSApplicationDelegate) is intentionally leaked so that it keeps running
+    /// for the lifetime of the process.  Use this when integrating with a
+    /// framework (e.g. Tauri) that already runs its own `NSApplication` event
+    /// loop on the main thread.
+    pub fn into_receiver(self) -> EventReceiver {
+        #[cfg(target_os = "macos")]
+        {
+            let (rx, guard) = (self.rx, self._guard);
+            // Forget the guard: NSApplication retains the delegate, NSNotificationCenter
+            // retains the power observer, and nw_path_monitor_start keeps the network
+            // monitor alive — all resources keep working without the Rust wrapper.
+            std::mem::forget(guard);
+            rx
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.rx
+        }
+    }
 }

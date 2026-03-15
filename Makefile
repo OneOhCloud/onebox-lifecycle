@@ -33,7 +33,7 @@ run: debug
 #
 # After this: use 'make log' to watch events, then trigger shutdown/sleep/network.
 run-detached: debug
-	@nohup ./$(BINARY) >> $(LOG) 2>&1 & \
+	@nohup ./$(BINARY) > /dev/null 2>&1 & \
 	 PID=$$! ; disown $$PID ; echo $$PID > .demo_pid ; \
 	 echo "Started PID=$$PID  log=$(LOG)"
 	@echo "Tip: 'make log' to tail, 'make stop' to kill"
