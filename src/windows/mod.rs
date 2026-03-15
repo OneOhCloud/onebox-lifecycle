@@ -63,6 +63,9 @@ struct WindowState {
     /// Signals the background watcher thread that `allow()` has been called,
     /// so it can invoke `ShutdownBlockReasonDestroy` and exit.
     shutdown_notify: Option<Arc<(Mutex<bool>, Condvar)>>,
+    /// Last known network reachability; `None` means not yet delivered.
+    /// Used to suppress duplicate NetworkUp/NetworkDown events.
+    last_network_up: Option<bool>,
 }
 
 // SAFETY: HWND is Send+Sync on Windows when used from the thread that created it.
@@ -103,6 +106,7 @@ unsafe fn run_message_loop(event_tx: EventSender) {
             event_tx,
             pending_shutdown_hwnd: None,
             shutdown_notify: None,
+            last_network_up: None,
         }));
         let state_ptr = Box::into_raw(state); // freed in WM_DESTROY
 
@@ -267,11 +271,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // ── Network change (custom message posted by the OS callback) ───────
         WM_SENTINEL_NETWORK_CHANGE => {
             let up = wparam.0 != 0;
-            let st = state_mutex.lock().unwrap();
-            if up {
-                st.event_tx.send(SystemEvent::NetworkUp);
-            } else {
-                st.event_tx.send(SystemEvent::NetworkDown);
+            let mut st = state_mutex.lock().unwrap();
+            if st.last_network_up != Some(up) {
+                st.last_network_up = Some(up);
+                if up {
+                    st.event_tx.send(SystemEvent::NetworkUp);
+                } else {
+                    st.event_tx.send(SystemEvent::NetworkDown);
+                }
             }
             LRESULT(0)
         }
