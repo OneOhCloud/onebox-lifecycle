@@ -69,9 +69,7 @@ observer、NWPathMonitor）被 leak 并持续运行，`EventReceiver`（实现�
 
 ```toml
 [dependencies]
-onebox_lifecycle = { path = "../onebox-lifecycle" }
-# 发布后：
-# onebox_lifecycle = "0.1"
+onebox_lifecycle = { git = "https://github.com/OneOhCloud/onebox-lifecycle" }
 ```
 
 **`src-tauri/src/lib.rs`**

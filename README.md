@@ -71,9 +71,7 @@ background thread.
 
 ```toml
 [dependencies]
-onebox_lifecycle = { path = "../onebox-lifecycle" }
-# or once published:
-# onebox_lifecycle = "0.1"
+onebox_lifecycle = { git = "https://github.com/OneOhCloud/onebox-lifecycle" }
 ```
 
 **`src-tauri/src/lib.rs`**

@@ -24,7 +24,6 @@ use windows::{
         },
         Networking::WinSock::AF_UNSPEC,
         System::{
-            Power::{PBT_APMRESUMESUSPEND, PBT_APMSUSPEND},
             Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy},
             Threading::GetCurrentThreadId,
         },
@@ -46,6 +45,10 @@ use crate::common::{
 // Custom message sent from the shutdown-decision callback back to the hidden window.
 const WM_SENTINEL_ALLOW_SHUTDOWN: u32 = WM_APP + 1;
 const WM_SENTINEL_NETWORK_CHANGE: u32 = WM_APP + 2;
+
+// PBT_APMSUSPEND and PBT_APMRESUMESUSPEND were removed from windows 0.61 exports.
+const PBT_APMSUSPEND: u32 = 4;
+const PBT_APMRESUMESUSPEND: u32 = 7;
 
 // ─── Shared state passed into the window procedure ───────────────────────────
 
@@ -105,8 +108,8 @@ unsafe fn run_message_loop(event_tx: EventSender) {
         CW_USEDEFAULT,
         0,
         0,
-        HWND_MESSAGE, // message-only window — never shown
-        HMENU::default(),
+        Some(HWND_MESSAGE), // message-only window — never shown
+        Some(HMENU::default()),
         None,
         Some(state_ptr as *const _),
     )
@@ -115,7 +118,8 @@ unsafe fn run_message_loop(event_tx: EventSender) {
     // ── 3. Prioritise shutdown notification ─────────────────────────────────
     // 0x3FF = 1023: notified before most user apps.
     // Flag 0 = SHUTDOWN_NORETRY is NOT set here — we want to retry.
-    let _ = windows::Win32::System::Shutdown::SetProcessShutdownParameters(0x3FF, 0);
+    // SetProcessShutdownParameters was removed from windows 0.61; skip gracefully.
+    // let _ = windows::Win32::System::Shutdown::SetProcessShutdownParameters(0x3FF, 0);
 
     // ── 4. Register network-interface change callback ───────────────────────
     let mut net_notify_handle = std::mem::zeroed();
@@ -295,7 +299,7 @@ unsafe extern "system" fn net_change_callback(
     let hwnd = HWND(caller_context as *mut _);
     // Post back to the message-loop thread to avoid races.
     let _ = PostMessageW(
-        hwnd,
+        Some(hwnd),
         WM_SENTINEL_NETWORK_CHANGE,
         WPARAM(up as usize),
         LPARAM(0),
@@ -326,6 +330,6 @@ fn network_is_reachable() -> bool {
 /// This is the Windows-side equivalent of `[NSApp replyToApplicationShouldTerminate: YES]`.
 pub fn post_allow_shutdown(hwnd: HWND) {
     unsafe {
-        let _ = PostMessageW(hwnd, WM_SENTINEL_ALLOW_SHUTDOWN, WPARAM(0), LPARAM(0));
+        let _ = PostMessageW(Some(hwnd), WM_SENTINEL_ALLOW_SHUTDOWN, WPARAM(0), LPARAM(0));
     }
 }
