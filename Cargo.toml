@@ -40,4 +40,8 @@ block2 = "0.6"
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 
+[[example]]
+name = "demo_full"
+required-features = []
+
 [target.'cfg(target_os = "windows")'.build-dependencies]

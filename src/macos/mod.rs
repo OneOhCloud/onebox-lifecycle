@@ -359,12 +359,17 @@ fn dispatch_to_main<F: FnOnce() + Send + 'static>(f: F) {
         }
     });
 
+    // `dispatch_get_main_queue()` is a C macro that expands to `&_dispatch_main_q`,
+    // so we must reference the underlying global directly — there is no callable
+    // function symbol by that name.
+    unsafe extern "C" {
+        // The global dispatch_queue_s that backs the main queue.
+        static _dispatch_main_q: std::ffi::c_void;
+        fn dispatch_async(queue: *const std::ffi::c_void, block: *const std::ffi::c_void);
+    }
+
     unsafe {
-        unsafe extern "C" {
-            fn dispatch_get_main_queue() -> *mut std::ffi::c_void;
-            fn dispatch_async(queue: *mut std::ffi::c_void, block: *const std::ffi::c_void);
-        }
-        let queue = dispatch_get_main_queue();
+        let queue = &raw const _dispatch_main_q;
         dispatch_async(queue, RcBlock::as_ptr(&block) as *const _);
     }
 }
