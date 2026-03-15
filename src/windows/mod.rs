@@ -9,11 +9,14 @@
 /// WM_QUERYENDSESSION
 ///   → send SystemEvent::ShuttingDown(handle)
 ///   → caller calls handle.block("reason")   ← we return FALSE + ShutdownBlockReasonCreate
+///                                              background thread waits on condvar
 ///   OR caller calls handle.allow()           ← we return TRUE (OS proceeds)
-///   → when cleanup done: call handle.allow()
-///       → background thread calls ShutdownBlockReasonDestroy + optional ExitWindowsEx
+///   → when cleanup done: call post_allow_shutdown(hwnd)
+///       → WM_SENTINEL_ALLOW_SHUTDOWN handler signals condvar
+///       → background thread wakes and calls ShutdownBlockReasonDestroy
+///       → OS re-sends WM_QUERYENDSESSION; this time allow() → TRUE
 /// ```
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use windows::{
     Win32::{
@@ -25,42 +28,47 @@ use windows::{
         Networking::WinSock::AF_UNSPEC,
         System::{
             Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy},
-            Threading::GetCurrentThreadId,
+            Threading::SetProcessShutdownParameters,
         },
         UI::WindowsAndMessaging::{
-            CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
+            CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
             DispatchMessageW, GetMessageW, HMENU, HWND_MESSAGE, MSG, PostMessageW,
-            PostThreadMessageW, RegisterClassExW, TranslateMessage, UnregisterClassW,
-            WINDOW_EX_STYLE, WM_APP, WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_QUIT, WNDCLASSEXW,
-            WS_OVERLAPPED,
+            RegisterClassExW, TranslateMessage, UnregisterClassW, WINDOW_EX_STYLE, WM_APP,
+            WM_POWERBROADCAST, WM_QUERYENDSESSION, WNDCLASSEXW, WS_OVERLAPPED,
         },
     },
-    core::PCWSTR,
+    core::{PCWSTR, w},
 };
 
 use crate::common::{
     EventSender, ShutdownDecision, ShutdownHandle, ShutdownHandleInner, SystemEvent,
 };
 
-// Custom message sent from the shutdown-decision callback back to the hidden window.
+// Custom messages sent back to the hidden window from other threads/callbacks.
 const WM_SENTINEL_ALLOW_SHUTDOWN: u32 = WM_APP + 1;
 const WM_SENTINEL_NETWORK_CHANGE: u32 = WM_APP + 2;
 
-// PBT_APMSUSPEND and PBT_APMRESUMESUSPEND were removed from windows 0.61 exports.
+// These power-event codes are not re-exported as named constants in windows-rs.
 const PBT_APMSUSPEND: u32 = 4;
 const PBT_APMRESUMESUSPEND: u32 = 7;
+
+// Compile-time UTF-16 class name — no heap allocation.
+const CLASS_NAME: PCWSTR = w!("SysSentinelHidden");
 
 // ─── Shared state passed into the window procedure ───────────────────────────
 
 struct WindowState {
     event_tx: EventSender,
-    /// Set when we are blocking a pending shutdown query.
-    /// The HWND is stored so the background callback can send WM_SENTINEL_ALLOW_SHUTDOWN.
+    /// Set while we are blocking a pending shutdown query.
     pending_shutdown_hwnd: Option<HWND>,
+    /// Signals the background watcher thread that `allow()` has been called,
+    /// so it can invoke `ShutdownBlockReasonDestroy` and exit.
+    shutdown_notify: Option<Arc<(Mutex<bool>, Condvar)>>,
 }
 
 // SAFETY: HWND is Send+Sync on Windows when used from the thread that created it.
-// We pin all HWND usage to the message-loop thread, so this is safe here.
+// All HWND usage is pinned to the message-loop thread; the raw pointer in
+// `shutdown_notify` is never dereferenced across threads.
 unsafe impl Send for WindowState {}
 unsafe impl Sync for WindowState {}
 
@@ -80,101 +88,98 @@ pub fn start(event_tx: EventSender) {
 }
 
 unsafe fn run_message_loop(event_tx: EventSender) {
-    // ── 1. Register a window class ──────────────────────────────────────────
-    let class_name: Vec<u16> = "SysSentinelHidden\0".encode_utf16().collect();
+    unsafe {
+        // ── 1. Register a window class ──────────────────────────────────────
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(wndproc),
+            lpszClassName: CLASS_NAME,
+            ..Default::default()
+        };
+        RegisterClassExW(&wc);
 
-    let wc = WNDCLASSEXW {
-        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-        style: CS_HREDRAW | CS_VREDRAW,
-        lpfnWndProc: Some(wndproc),
-        lpszClassName: PCWSTR(class_name.as_ptr()),
-        ..Default::default()
-    };
-    RegisterClassExW(&wc);
+        // ── 2. Create a message-only (hidden) window ────────────────────────
+        let state = Box::new(Mutex::new(WindowState {
+            event_tx,
+            pending_shutdown_hwnd: None,
+            shutdown_notify: None,
+        }));
+        let state_ptr = Box::into_raw(state); // freed in WM_DESTROY
 
-    // ── 2. Create a message-only (hidden) window ────────────────────────────
-    let state = Box::new(Mutex::new(WindowState {
-        event_tx,
-        pending_shutdown_hwnd: None,
-    }));
-    let state_ptr = Box::into_raw(state); // freed in WM_DESTROY
+        let hwnd = CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            CLASS_NAME,
+            w!("SysSentinel"),
+            WS_OVERLAPPED,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            0,
+            0,
+            Some(HWND_MESSAGE), // message-only window — never shown
+            Some(HMENU::default()),
+            None,
+            Some(state_ptr as *const _),
+        )
+        .expect("onebox_lifecycle: CreateWindowExW failed");
 
-    let hwnd = CreateWindowExW(
-        WINDOW_EX_STYLE::default(),
-        PCWSTR(class_name.as_ptr()),
-        PCWSTR("SysSentinel\0".encode_utf16().collect::<Vec<_>>().as_ptr()),
-        WS_OVERLAPPED,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
-        0,
-        0,
-        Some(HWND_MESSAGE), // message-only window — never shown
-        Some(HMENU::default()),
-        None,
-        Some(state_ptr as *const _),
-    )
-    .expect("onebox_lifecycle: CreateWindowExW failed");
+        // ── 3. Prioritise shutdown notification ─────────────────────────────
+        // Level 0x3FF = 1023: our process is notified before most user apps.
+        // Flags = 0: SHUTDOWN_NORETRY is NOT set (we want OS to retry after we unblock).
+        let _ = SetProcessShutdownParameters(0x3FF, 0);
 
-    // ── 3. Prioritise shutdown notification ─────────────────────────────────
-    // 0x3FF = 1023: notified before most user apps.
-    // Flag 0 = SHUTDOWN_NORETRY is NOT set here — we want to retry.
-    // SetProcessShutdownParameters was removed from windows 0.61; skip gracefully.
-    // let _ = windows::Win32::System::Shutdown::SetProcessShutdownParameters(0x3FF, 0);
+        // ── 4. Register network-interface change callback ───────────────────
+        let mut net_notify_handle = std::mem::zeroed();
+        let _ = NotifyIpInterfaceChange(
+            AF_UNSPEC,
+            Some(net_change_callback),
+            // Pass HWND.0 (*mut c_void) as the opaque context pointer.
+            Some(hwnd.0 as *const _),
+            false,
+            &mut net_notify_handle,
+        );
 
-    // ── 4. Register network-interface change callback ───────────────────────
-    let mut net_notify_handle = std::mem::zeroed();
-    let hwnd_clone = hwnd;
-    let _ = NotifyIpInterfaceChange(
-        AF_UNSPEC,
-        Some(net_change_callback),
-        Some(hwnd_clone.0 as *const _),
-        false,
-        &mut net_notify_handle,
-    );
-
-    // ── 5. Pump messages ────────────────────────────────────────────────────
-    let mut msg = MSG::default();
-    loop {
-        let ret = GetMessageW(&mut msg, None, 0, 0);
-        if ret.0 == 0 || ret.0 == -1 {
-            break;
+        // ── 5. Pump messages ────────────────────────────────────────────────
+        let mut msg = MSG::default();
+        loop {
+            let ret = GetMessageW(&mut msg, None, 0, 0);
+            if ret.0 == 0 || ret.0 == -1 {
+                break;
+            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
         }
-        let _ = TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
 
-    // ── 6. Cleanup ──────────────────────────────────────────────────────────
-    let _ = CancelMibChangeNotify2(net_notify_handle);
-    let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), None);
+        // ── 6. Cleanup ──────────────────────────────────────────────────────
+        let _ = CancelMibChangeNotify2(net_notify_handle);
+        let _ = UnregisterClassW(CLASS_NAME, None);
+    }
 }
 
 // ─── Window procedure ─────────────────────────────────────────────────────────
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    // Retrieve the state pointer stored in the window's user data.
     use windows::Win32::UI::WindowsAndMessaging::{
-        CREATESTRUCTW, GWLP_USERDATA, GetWindowLongPtrW, SetWindowLongPtrW, WM_CREATE, WM_DESTROY,
-        WM_NCCREATE,
+        CREATESTRUCTW, GWLP_USERDATA, GetWindowLongPtrW, SetWindowLongPtrW, WM_DESTROY, WM_NCCREATE,
     };
 
     if msg == WM_NCCREATE {
-        // Stash the state pointer in GWLP_USERDATA at creation time.
-        let cs = &*(lparam.0 as *const CREATESTRUCTW);
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
-        return DefWindowProcW(hwnd, msg, wparam, lparam);
+        unsafe {
+            let cs = &*(lparam.0 as *const CREATESTRUCTW);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
     }
 
-    let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Mutex<WindowState>;
+    let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Mutex<WindowState>;
     if state_ptr.is_null() {
-        return DefWindowProcW(hwnd, msg, wparam, lparam);
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
-    let state_mutex = &*state_ptr;
+    let state_mutex = unsafe { &*state_ptr };
 
     match msg {
         // ── Shutdown query ──────────────────────────────────────────────────
         WM_QUERYENDSESSION => {
-            // Build a one-shot channel so the caller's ShutdownHandle can report
-            // its decision back to us.
             let (decision_tx, decision_rx) = std::sync::mpsc::sync_channel::<ShutdownDecision>(1);
 
             let handle = ShutdownHandle {
@@ -187,8 +192,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 st.event_tx.send(SystemEvent::ShuttingDown(handle));
             }
 
-            // Wait (with a short timeout) for the caller to decide.
-            // If they don't respond in time, we default to blocking — safer.
+            // Wait up to 2 s for the caller to decide.  Default to blocking
+            // (safer than silently allowing shutdown mid-cleanup).
             let decision = decision_rx
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .unwrap_or(ShutdownDecision::Block {
@@ -206,33 +211,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         .encode_utf16()
                         .chain(std::iter::once(0))
                         .collect();
-                    let _ = ShutdownBlockReasonCreate(hwnd, PCWSTR(wide.as_ptr()));
+                    let _ = unsafe { ShutdownBlockReasonCreate(hwnd, PCWSTR(wide.as_ptr())) };
 
-                    // Spawn a background task that watches for the eventual allow signal.
-                    // We send ourselves WM_SENTINEL_ALLOW_SHUTDOWN when the user calls allow().
-                    let hwnd_val = hwnd.0 as usize; // usize is Send
-                    let state_ptr_usize = state_ptr as usize;
+                    // Set up a condvar so WM_SENTINEL_ALLOW_SHUTDOWN can wake
+                    // the background thread without polling.
+                    let notify = Arc::new((Mutex::new(false), Condvar::new()));
+                    let notify_clone = Arc::clone(&notify);
+                    state_mutex.lock().unwrap().shutdown_notify = Some(notify);
+
+                    // hwnd.0 is *mut c_void; cast to usize for Send across threads.
+                    let hwnd_usize = hwnd.0 as usize;
                     std::thread::spawn(move || {
-                        // The caller still holds the *original* handle — they will call
-                        // allow() when cleanup is done, which sends the decision on a
-                        // *different* channel.  We can't observe that here directly.
-                        //
-                        // Pattern: the caller should call `ShutdownHandle::allow()`, which
-                        // posts WM_SENTINEL_ALLOW_SHUTDOWN via the helper below.
-                        // For demonstration, we poll every 200 ms for up to 5 minutes.
-                        let hw = HWND(hwnd_val as *mut _);
-                        for _ in 0..1500 {
-                            std::thread::sleep(std::time::Duration::from_millis(200));
-                            let st = unsafe { &*(state_ptr_usize as *mut Mutex<WindowState>) };
-                            if st.lock().unwrap().pending_shutdown_hwnd.is_none() {
-                                // Allow signal received via WM_SENTINEL_ALLOW_SHUTDOWN.
-                                break;
-                            }
-                        }
-                        // Whether timeout or allow, destroy the block reason so
-                        // the OS can proceed on the next WM_QUERYENDSESSION.
+                        let (lock, cvar) = &*notify_clone;
+                        let guard = lock.lock().unwrap();
+                        // Block until allow() is signalled or 5-minute safety timeout.
+                        let _ = cvar.wait_timeout_while(
+                            guard,
+                            std::time::Duration::from_secs(300),
+                            |&mut done| !done,
+                        );
+                        // Only this thread calls ShutdownBlockReasonDestroy.
                         unsafe {
-                            let _ = ShutdownBlockReasonDestroy(hw);
+                            let _ = ShutdownBlockReasonDestroy(HWND(hwnd_usize as *mut _));
                         }
                     });
 
@@ -241,11 +241,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
         }
 
-        // ── Async cleanup finished → clear pending shutdown ─────────────────
+        // ── Async cleanup finished → signal the watcher thread ─────────────
         WM_SENTINEL_ALLOW_SHUTDOWN => {
             let mut st = state_mutex.lock().unwrap();
-            if let Some(hw) = st.pending_shutdown_hwnd.take() {
-                let _ = ShutdownBlockReasonDestroy(hw);
+            st.pending_shutdown_hwnd = None;
+            if let Some(notify) = st.shutdown_notify.take() {
+                let (lock, cvar) = &*notify;
+                *lock.lock().unwrap() = true;
+                cvar.notify_one();
             }
             LRESULT(0)
         }
@@ -262,7 +265,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(1)
         }
 
-        // ── Network change (custom message from callback) ───────────────────
+        // ── Network change (custom message posted by the OS callback) ───────
         WM_SENTINEL_NETWORK_CHANGE => {
             let up = wparam.0 != 0;
             let st = state_mutex.lock().unwrap();
@@ -276,34 +279,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
         // ── Teardown ────────────────────────────────────────────────────────
         WM_DESTROY => {
-            // Free the state box.
-            drop(Box::from_raw(state_ptr));
+            drop(unsafe { Box::from_raw(state_ptr) });
             LRESULT(0)
         }
 
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
 
 // ─── Network change callback (called by the OS on a system thread) ────────────
 
 unsafe extern "system" fn net_change_callback(
-    caller_context: *const std::ffi::c_void,
+    caller_context: *const core::ffi::c_void,
     _row: *const MIB_IPINTERFACE_ROW,
     _notification_type: MIB_NOTIFICATION_TYPE,
 ) {
-    // Determine connectivity (simplistic: any interface = up).
-    // A more thorough impl would query GetIpInterfaceTable.
     let up = network_is_reachable();
-
+    // Reconstruct the HWND from the opaque context pointer we passed at registration.
     let hwnd = HWND(caller_context as *mut _);
-    // Post back to the message-loop thread to avoid races.
-    let _ = PostMessageW(
-        Some(hwnd),
-        WM_SENTINEL_NETWORK_CHANGE,
-        WPARAM(up as usize),
-        LPARAM(0),
-    );
+    // Post to the message-loop thread to avoid data races on WindowState.
+    let _ = unsafe {
+        PostMessageW(
+            Some(hwnd),
+            WM_SENTINEL_NETWORK_CHANGE,
+            WPARAM(up as usize),
+            LPARAM(0),
+        )
+    };
 }
 
 fn network_is_reachable() -> bool {
@@ -325,9 +327,14 @@ fn network_is_reachable() -> bool {
 
 // ─── Public helper: post the "allow shutdown" message from any thread ─────────
 
-/// Call this from your cleanup-complete handler to let the OS proceed with shutdown.
+/// Call this once your async cleanup is complete to let the OS proceed with shutdown.
 ///
-/// This is the Windows-side equivalent of `[NSApp replyToApplicationShouldTerminate: YES]`.
+/// This posts [`WM_SENTINEL_ALLOW_SHUTDOWN`] to the hidden sentinel window, which
+/// wakes the background watcher thread and causes it to call
+/// `ShutdownBlockReasonDestroy`.  The OS will then re-issue `WM_QUERYENDSESSION`
+/// and the next [`ShutdownHandle::allow`] call will return `TRUE`.
+///
+/// Equivalent to `[NSApp replyToApplicationShouldTerminate: YES]` on macOS.
 pub fn post_allow_shutdown(hwnd: HWND) {
     unsafe {
         let _ = PostMessageW(Some(hwnd), WM_SENTINEL_ALLOW_SHUTDOWN, WPARAM(0), LPARAM(0));
