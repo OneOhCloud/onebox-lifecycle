@@ -335,6 +335,8 @@ fn network_is_reachable() -> bool {
 /// and the next [`ShutdownHandle::allow`] call will return `TRUE`.
 ///
 /// Equivalent to `[NSApp replyToApplicationShouldTerminate: YES]` on macOS.
+
+#[allow(dead_code)]
 pub fn post_allow_shutdown(hwnd: HWND) {
     unsafe {
         let _ = PostMessageW(Some(hwnd), WM_SENTINEL_ALLOW_SHUTDOWN, WPARAM(0), LPARAM(0));
