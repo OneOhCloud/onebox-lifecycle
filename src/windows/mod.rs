@@ -20,12 +20,14 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use windows::{
     Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM},
         NetworkManagement::IpHelper::{
-            CancelMibChangeNotify2, MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE,
-            NotifyIpInterfaceChange,
+            CancelMibChangeNotify2, NotifyNetworkConnectivityHintChange,
         },
-        Networking::WinSock::AF_UNSPEC,
+        Networking::WinSock::{
+            NL_NETWORK_CONNECTIVITY_HINT, NetworkConnectivityLevelHintConstrainedInternetAccess,
+            NetworkConnectivityLevelHintInternetAccess,
+        },
         System::{
             Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy},
             Threading::SetProcessShutdownParameters,
@@ -131,14 +133,17 @@ unsafe fn run_message_loop(event_tx: EventSender) {
         // Flags = 0: SHUTDOWN_NORETRY is NOT set (we want OS to retry after we unblock).
         let _ = SetProcessShutdownParameters(0x3FF, 0);
 
-        // ── 4. Register network-interface change callback ───────────────────
-        let mut net_notify_handle = std::mem::zeroed();
-        let _ = NotifyIpInterfaceChange(
-            AF_UNSPEC,
+        // ── 4. Register NCSI connectivity-hint change callback ──────────────
+        // NotifyNetworkConnectivityHintChange fires when Windows NCSI flips
+        // between None / LocalAccess / InternetAccess, matching the taskbar
+        // network icon.  initialnotification=true delivers the current state
+        // immediately so last_network_up is set before the first real change.
+        let mut net_notify_handle: HANDLE = std::mem::zeroed();
+        let _ = NotifyNetworkConnectivityHintChange(
             Some(net_change_callback),
             // Pass HWND.0 (*mut c_void) as the opaque context pointer.
             Some(hwnd.0 as *const _),
-            false,
+            true, // deliver current state immediately
             &mut net_notify_handle,
         );
 
@@ -297,13 +302,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
 unsafe extern "system" fn net_change_callback(
     caller_context: *const core::ffi::c_void,
-    _row: *const MIB_IPINTERFACE_ROW,
-    _notification_type: MIB_NOTIFICATION_TYPE,
+    hint: NL_NETWORK_CONNECTIVITY_HINT,
 ) {
-    let up = network_is_reachable();
-    // Reconstruct the HWND from the opaque context pointer we passed at registration.
+    // InternetAccess (3)            – full internet
+    // ConstrainedInternetAccess (4) – captive portal; some connectivity
+    let up = hint.ConnectivityLevel == NetworkConnectivityLevelHintInternetAccess
+        || hint.ConnectivityLevel == NetworkConnectivityLevelHintConstrainedInternetAccess;
     let hwnd = HWND(caller_context as *mut _);
-    // Post to the message-loop thread to avoid data races on WindowState.
     let _ = unsafe {
         PostMessageW(
             Some(hwnd),
@@ -312,39 +317,6 @@ unsafe extern "system" fn net_change_callback(
             LPARAM(0),
         )
     };
-}
-
-fn network_is_reachable() -> bool {
-    use windows::Win32::NetworkManagement::IpHelper::{
-        FreeMibTable, GetIfEntry2, GetIpInterfaceTable, MIB_IF_ROW2, MIB_IPINTERFACE_TABLE,
-    };
-    use windows::Win32::Networking::WinSock::AF_INET;
-
-    // IF_TYPE_SOFTWARE_LOOPBACK = 24 (from ipifcons.h); always present, not a real network.
-    const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
-    // IF_OPER_STATUS: IfOperStatusUp = 1
-    const OPER_STATUS_UP: i32 = 1;
-
-    unsafe {
-        let mut table: *mut MIB_IPINTERFACE_TABLE = std::ptr::null_mut();
-        if GetIpInterfaceTable(AF_INET, &mut table).is_ok() {
-            let num = (*table).NumEntries as usize;
-            let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), num);
-            let reachable = rows.iter().any(|row| {
-                let mut if_row = MIB_IF_ROW2 {
-                    InterfaceLuid: row.InterfaceLuid,
-                    ..Default::default()
-                };
-                GetIfEntry2(&mut if_row).is_ok()
-                    && if_row.Type != IF_TYPE_SOFTWARE_LOOPBACK
-                    && if_row.OperStatus.0 == OPER_STATUS_UP
-            });
-            FreeMibTable(table as *mut _);
-            reachable
-        } else {
-            false
-        }
-    }
 }
 
 // ─── Public helper: post the "allow shutdown" message from any thread ─────────
