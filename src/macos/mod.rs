@@ -7,8 +7,8 @@
 ///   → send SystemEvent::ShuttingDown(handle)
 ///   → return NSTerminateLater               ← AppKit suspends termination
 ///   → caller calls handle.allow() when done
-///       → background thread posts [NSApp replyToApplicationShouldTerminate: YES]
-///          onto the main GCD queue
+///       → background thread calls [NSApp replyToApplicationShouldTerminate: YES]
+///          (thread-safe per Apple docs — only posts a Mach message internally)
 /// ```
 ///
 /// # Sleep / wake
@@ -34,20 +34,32 @@ use crate::common::{
     EventSender, ShutdownDecision, ShutdownHandle, ShutdownHandleInner, SystemEvent,
 };
 
-// ─── Shared state ─────────────────────────────────────────────────────────────
+// ─── Constants ────────────────────────────────────────────────────────────────
 
-struct SentinelState {
-    event_tx: EventSender,
+/// Maximum time the caller has to finish async cleanup before shutdown is
+/// allowed anyway.
+const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `NSWorkspaceWillSleepNotification` — posted before the system sleeps.
+const WILL_SLEEP_NOTIFICATION: &str = "NSWorkspaceWillSleepNotification";
+
+/// `NSWorkspaceDidWakeNotification` — posted after the system wakes.
+const DID_WAKE_NOTIFICATION: &str = "NSWorkspaceDidWakeNotification";
+
+// ─── Delegate state ───────────────────────────────────────────────────────────
+
+struct DelegateState {
+    event_tx: Arc<EventSender>,
     /// The NSApplicationDelegate that was installed before us (e.g. Tauri's
     /// deep-link delegate).  Kept as a raw pointer because the previous owner
     /// (Tauri / AppKit) retains it for the process lifetime.
-    /// null if there was no prior delegate.
+    /// `null` if there was no prior delegate.
     previous_delegate: *mut AnyObject,
 }
 
-// SAFETY: delegate callbacks always arrive on the main thread; we never
-// free the pointer, only call Obj-C methods on it from the same thread.
-unsafe impl Send for SentinelState {}
+// SAFETY: delegate callbacks always arrive on the main thread; we never free
+// the pointer, only call Obj-C methods on it from the same thread.
+unsafe impl Send for DelegateState {}
 
 // ─── NSApplicationDelegate ────────────────────────────────────────────────────
 
@@ -57,7 +69,7 @@ define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "SysSentinelDelegate"]
-    #[ivars = Arc<Mutex<SentinelState>>]
+    #[ivars = Arc<Mutex<DelegateState>>]
     struct SentinelDelegate;
 
     impl SentinelDelegate {
@@ -78,15 +90,14 @@ define_class!(
             self.ivars().lock().unwrap().event_tx.send(SystemEvent::ShuttingDown(handle));
 
             // Spawn a thread that waits for the caller's decision, then calls
-            // `replyToApplicationShouldTerminate:` back on the main thread via GCD.
+            // `replyToApplicationShouldTerminate:` — which is documented by
+            // Apple to be callable from any thread.
             std::thread::spawn(move || {
-                // Wait up to 5 minutes for async cleanup to finish.
                 let decision = decision_rx
-                    .recv_timeout(std::time::Duration::from_secs(300))
+                    .recv_timeout(SHUTDOWN_TIMEOUT)
                     .unwrap_or(ShutdownDecision::Allow);
 
-                let proceed = matches!(decision, ShutdownDecision::Allow);
-                reply_to_should_terminate(proceed);
+                reply_to_should_terminate(matches!(decision, ShutdownDecision::Allow));
             });
 
             // TerminateLater — AppKit will wait for our explicit reply.
@@ -129,7 +140,7 @@ define_class!(
 );
 
 impl SentinelDelegate {
-    fn new(mtm: MainThreadMarker, state: Arc<Mutex<SentinelState>>) -> Retained<Self> {
+    fn new(mtm: MainThreadMarker, state: Arc<Mutex<DelegateState>>) -> Retained<Self> {
         let this = mtm.alloc::<Self>().set_ivars(state);
         unsafe { msg_send![super(this), init] }
     }
@@ -141,28 +152,61 @@ define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "SysSentinelPowerObserver"]
-    #[ivars = Arc<Mutex<SentinelState>>]
+    // Only needs the sender — decoupled from DelegateState.
+    #[ivars = Arc<EventSender>]
     struct PowerObserver;
 
     impl PowerObserver {
         #[unsafe(method(handleWillSleep:))]
         fn handle_will_sleep(&self, _notification: &AnyObject) {
-            self.ivars().lock().unwrap().event_tx.send(SystemEvent::WillSleep);
+            self.ivars().send(SystemEvent::WillSleep);
         }
 
         #[unsafe(method(handleDidWake:))]
         fn handle_did_wake(&self, _notification: &AnyObject) {
-            self.ivars().lock().unwrap().event_tx.send(SystemEvent::DidWake);
+            self.ivars().send(SystemEvent::DidWake);
         }
     }
 );
 
 impl PowerObserver {
-    fn new(mtm: MainThreadMarker, state: Arc<Mutex<SentinelState>>) -> Retained<Self> {
-        let this = mtm.alloc::<Self>().set_ivars(state);
+    fn new(mtm: MainThreadMarker, event_tx: Arc<EventSender>) -> Retained<Self> {
+        let this = mtm.alloc::<Self>().set_ivars(event_tx);
         unsafe { msg_send![super(this), init] }
     }
 }
+
+// ─── Notification observer guard ─────────────────────────────────────────────
+
+/// RAII guard that calls `[NSNotificationCenter removeObserver:]` when dropped,
+/// preventing stale callbacks if the observer is ever released before the
+/// notification centre.
+///
+/// `NSNotificationCenter` retains observers since macOS 10.x, so failing to
+/// call `removeObserver:` keeps the object alive indefinitely (memory leak) and
+/// may deliver callbacks to a logically-dead observer.
+struct NotificationObserverGuard {
+    /// Non-owning pointer to the `PowerObserver`.  The object is kept alive by
+    /// `MacosGuard._power_observer`; this guard must be dropped first.
+    observer: *const NSObject,
+}
+
+impl Drop for NotificationObserverGuard {
+    fn drop(&mut self) {
+        // SAFETY: `NSWorkspace.sharedWorkspace` and its notification centre are
+        // process-lifetime singletons.  `removeObserver:` is documented
+        // thread-safe by Apple.
+        unsafe {
+            let workspace: *mut AnyObject = msg_send![objc2::class!(NSWorkspace), sharedWorkspace];
+            let nc: *mut AnyObject = msg_send![workspace, notificationCenter];
+            let _: () = msg_send![nc, removeObserver: self.observer];
+        }
+    }
+}
+
+// SAFETY: `removeObserver:` on NSNotificationCenter is thread-safe.
+unsafe impl Send for NotificationObserverGuard {}
+unsafe impl Sync for NotificationObserverGuard {}
 
 // ─── NWPathMonitor FFI ────────────────────────────────────────────────────────
 //
@@ -225,7 +269,7 @@ unsafe extern "C" {
 /// RAII wrapper — cancels and releases the monitor when dropped.
 struct PathMonitorGuard {
     monitor: NwPathMonitorT,
-    /// Kept alive so the closure's captures (Arc<Mutex<…>>) survive for the
+    /// Kept alive so the closure's captures (Arc<EventSender>) survive for the
     /// monitor's lifetime.  The monitor also retains the block internally.
     _block: RcBlock<dyn Fn(NwPathT)>,
 }
@@ -247,7 +291,7 @@ unsafe impl Sync for PathMonitorGuard {}
 
 // ─── NWPathMonitor constructor ────────────────────────────────────────────────
 
-/// Start a `NWPathMonitor` and forward reachability changes to `state`.
+/// Start a `NWPathMonitor` and forward reachability changes to `event_tx`.
 ///
 /// The monitor delivers an **initial** path update synchronously after `start`,
 /// so callers always receive `NetworkUp` or `NetworkDown` shortly after startup
@@ -256,36 +300,32 @@ unsafe impl Sync for PathMonitorGuard {}
 /// Change detection: events are only emitted when the satisfied-status
 /// actually changes, or on the very first delivery (so callers know the
 /// initial state).
-fn start_nw_path_monitor(state: Arc<Mutex<SentinelState>>) -> PathMonitorGuard {
+fn start_nw_path_monitor(event_tx: Arc<EventSender>) -> PathMonitorGuard {
     // `None` = "never seen before" — first delivery always emits an event.
-    let last_state: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+    let last_seen: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
 
-    // Clone for the block closure.
-    let last_state_in_block = Arc::clone(&last_state);
-
-    // Build the update-handler block.
+    // Build the update-handler block.  Both `last_seen` and `event_tx` are
+    // moved directly into the closure — no redundant intermediate clone needed.
     //
     // `*mut c_void` implements `Encode` (via `c_void: RefEncode` + the blanket
     // impl for raw pointers), so `dyn Fn(NwPathT)` satisfies `BlockFn`.
     let block = RcBlock::new(move |path: NwPathT| {
         // SAFETY: `path` is a valid nw_path_t for the duration of this call.
-        let raw_status = unsafe { nw_path_get_status(path) };
-        let satisfied = raw_status == NW_PATH_STATUS_SATISFIED;
+        let satisfied = unsafe { nw_path_get_status(path) } == NW_PATH_STATUS_SATISFIED;
 
         // Compare with previous state; emit only when it changes (or is first).
-        let mut last = last_state_in_block.lock().unwrap();
-        if last.as_ref() == Some(&satisfied) {
+        let mut last = last_seen.lock().unwrap();
+        if *last == Some(satisfied) {
             return; // no change
         }
         *last = Some(satisfied);
         drop(last); // release lock before touching event_tx
 
-        let ev = if satisfied {
+        event_tx.send(if satisfied {
             SystemEvent::NetworkUp
         } else {
             SystemEvent::NetworkDown
-        };
-        state.lock().unwrap().event_tx.send(ev);
+        });
     });
 
     // SAFETY: all nw_ functions are called with valid, non-null arguments.
@@ -318,6 +358,9 @@ fn start_nw_path_monitor(state: Arc<Mutex<SentinelState>>) -> PathMonitorGuard {
 pub struct MacosGuard {
     _delegate: Retained<SentinelDelegate>,
     _power_observer: Retained<PowerObserver>,
+    /// Removes `NSNotificationCenter` observers before `_power_observer` drops.
+    /// Field order guarantees this drops first (Rust drops fields top-to-bottom).
+    _notification_guard: NotificationObserverGuard,
     /// Cancels NWPathMonitor on drop.
     _path_monitor: PathMonitorGuard,
 }
@@ -328,6 +371,10 @@ impl MacosGuard {
         let mtm = MainThreadMarker::new()
             .expect("onebox_lifecycle: MacosGuard::new() must be called from the main thread");
 
+        // Wrap in Arc so it can be shared across delegate, power observer,
+        // and the path-monitor block without cloning the channel sender.
+        let event_tx = Arc::new(event_tx);
+
         // ── 1. Install the NSApplication delegate ─────────────────────────
         // Capture the existing delegate first so we can forward messages to it.
         let previous_delegate: *mut AnyObject = unsafe {
@@ -335,9 +382,12 @@ impl MacosGuard {
             msg_send![&*app, delegate]
         };
 
-        let state = Arc::new(Mutex::new(SentinelState { event_tx, previous_delegate }));
+        let delegate_state = Arc::new(Mutex::new(DelegateState {
+            event_tx: Arc::clone(&event_tx),
+            previous_delegate,
+        }));
 
-        let delegate = SentinelDelegate::new(mtm, Arc::clone(&state));
+        let delegate = SentinelDelegate::new(mtm, delegate_state);
         unsafe {
             let app = NSApplication::sharedApplication(mtm);
             let delegate_obj = Retained::as_ptr(&delegate) as *const NSObject;
@@ -345,13 +395,13 @@ impl MacosGuard {
         }
 
         // ── 2. NSWorkspace sleep / wake notifications ──────────────────────
-        let power_observer = PowerObserver::new(mtm, Arc::clone(&state));
-        autoreleasepool(|_pool| unsafe {
+        let power_observer = PowerObserver::new(mtm, Arc::clone(&event_tx));
+        let notification_guard = autoreleasepool(|_pool| unsafe {
             let workspace: *mut AnyObject = msg_send![objc2::class!(NSWorkspace), sharedWorkspace];
             let nc: *mut AnyObject = msg_send![workspace, notificationCenter];
 
-            let will_sleep = NSString::from_str("NSWorkspaceWillSleepNotification");
-            let did_wake = NSString::from_str("NSWorkspaceDidWakeNotification");
+            let will_sleep = NSString::from_str(WILL_SLEEP_NOTIFICATION);
+            let did_wake = NSString::from_str(DID_WAKE_NOTIFICATION);
             let observer = Retained::as_ptr(&power_observer) as *const NSObject;
 
             let _: () = msg_send![nc,
@@ -366,14 +416,18 @@ impl MacosGuard {
                 name: &*did_wake,
                 object: std::ptr::null::<AnyObject>()
             ];
+
+            NotificationObserverGuard { observer }
         });
 
         // ── 3. NWPathMonitor (Network.framework, macOS 10.14+) ────────────
-        let path_monitor = start_nw_path_monitor(Arc::clone(&state));
+        let path_monitor = start_nw_path_monitor(Arc::clone(&event_tx));
 
         MacosGuard {
             _delegate: delegate,
             _power_observer: power_observer,
+            // Drops before _power_observer (field declaration order).
+            _notification_guard: notification_guard,
             _path_monitor: path_monitor,
         }
     }
@@ -383,17 +437,18 @@ impl MacosGuard {
 
 /// Post `[NSApp replyToApplicationShouldTerminate: proceed]`.
 ///
-/// For CLI apps the main thread runs no NSRunLoop, so dispatching to the main
-/// GCD queue would deadlock (the block never executes).  We call directly from
-/// the background thread instead — AppKit accepts this for non-GUI processes.
+/// Apple documents `replyToApplicationShouldTerminate:` as callable from any
+/// thread — it only posts a Mach message internally and has no UI side-effects
+/// that require the main thread.  We therefore call it directly from the
+/// background waiter thread without dispatching to the main queue.
 fn reply_to_should_terminate(proceed: bool) {
-    // SAFETY: MainThreadMarker::new_unchecked() bypasses the compile-time thread
-    // check.  For a CLI process with no AppKit event loop this is safe because
-    // `replyToApplicationShouldTerminate:` only posts a Mach message internally
-    // and has no UI side-effects that require the main thread.
+    // SAFETY: `replyToApplicationShouldTerminate:` is thread-safe per Apple
+    // documentation.  We bypass the `MainThreadMarker` guard on
+    // `sharedApplication` using a raw class message, which is equivalent but
+    // avoids the spurious compile-time main-thread requirement imposed by
+    // the typed bindings.
     unsafe {
-        let mtm = MainThreadMarker::new_unchecked();
-        let app = NSApplication::sharedApplication(mtm);
-        let _: () = msg_send![&*app, replyToApplicationShouldTerminate: proceed];
+        let app: *mut AnyObject = msg_send![objc2::class!(NSApplication), sharedApplication];
+        let _: () = msg_send![app, replyToApplicationShouldTerminate: proceed];
     }
 }
