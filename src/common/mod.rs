@@ -18,7 +18,7 @@ pub(crate) enum ShutdownHandleInner {
     Tokio(tokio::sync::oneshot::Sender<ShutdownDecision>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[allow(dead_code)] // `reason` is read by the Windows backend
 pub(crate) enum ShutdownDecision {
     Allow,
@@ -96,14 +96,17 @@ impl std::fmt::Debug for SystemEvent {
 
 // ─── Channel helpers ─────────────────────────────────────────────────────────
 
-/// Synchronous multi-producer, single-consumer event channel.
-pub fn sync_channel(cap: usize) -> (EventSender, EventReceiver) {
-    let (tx, rx) = std::sync::mpsc::sync_channel(cap);
+/// Create an unbounded event channel.
+///
+/// The sender never blocks, which is critical for platform backends that call
+/// `send` from inside a Win32 window procedure or an OS callback.
+pub fn channel() -> (EventSender, EventReceiver) {
+    let (tx, rx) = std::sync::mpsc::channel();
     (EventSender { tx }, EventReceiver { rx })
 }
 
 pub struct EventSender {
-    pub(crate) tx: std::sync::mpsc::SyncSender<SystemEvent>,
+    pub(crate) tx: std::sync::mpsc::Sender<SystemEvent>,
 }
 
 pub struct EventReceiver {
@@ -149,10 +152,22 @@ pub mod tokio_support {
 
     impl AsyncEventSender {
         pub(crate) fn send(&self, ev: SystemEvent) {
+            // `tokio::spawn` panics when called outside a Tokio runtime (e.g. from
+            // the Win32 message-loop thread).  Use `try_current` so we only spawn
+            // a task when a runtime is actually present; otherwise fall back to
+            // `try_send` (lifecycle events are rare enough that backpressure drop
+            // is acceptable as a last resort).
             let tx = self.tx.clone();
-            tokio::spawn(async move {
-                let _ = tx.send(ev).await;
-            });
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(async move {
+                        let _ = tx.send(ev).await;
+                    });
+                }
+                Err(_) => {
+                    let _ = self.tx.try_send(ev);
+                }
+            }
         }
     }
 

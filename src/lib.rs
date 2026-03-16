@@ -8,7 +8,7 @@
 //! |--------------------|---------|-------|
 //! | Shutdown blocking  | ✓ (WM_QUERYENDSESSION + ShutdownBlockReasonCreate) | ✓ (NSTerminateLater) |
 //! | Sleep / wake       | ✓ (WM_POWERBROADCAST) | ✓ (NSWorkspace notifications) |
-//! | Network up / down  | ✓ (NotifyIpInterfaceChange) | ✓ (polling / NWPathMonitor) |
+//! | Network up / down  | ✓ (NotifyNetworkConnectivityHintChange) | ✓ (NWPathMonitor) |
 //! | Async cleanup      | ✓ (handle-based, tokio-compatible) | ✓ |
 //!
 //! ## Quick start
@@ -61,7 +61,7 @@
 //! }
 //! ```
 
-pub mod common;
+pub(crate) mod common;
 pub use common::{EventReceiver, EventSender, ShutdownHandle, SystemEvent};
 
 #[cfg(target_os = "windows")]
@@ -88,18 +88,18 @@ impl Sentinel {
     /// On **macOS**: installs an `NSApplicationDelegate` and registers for
     /// `NSWorkspace` power notifications.  **Must be called from the main thread.**
     pub fn start() -> Self {
-        let (tx, rx) = common::sync_channel(64);
+        let (tx, rx) = common::channel();
 
         #[cfg(target_os = "windows")]
         {
             windows::start(tx);
-            return Sentinel { rx };
+            Sentinel { rx }
         }
 
         #[cfg(target_os = "macos")]
         {
             let guard = macos::MacosGuard::new(tx);
-            return Sentinel { rx, _guard: guard };
+            Sentinel { rx, _guard: guard }
         }
 
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]

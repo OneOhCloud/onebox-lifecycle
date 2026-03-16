@@ -16,6 +16,7 @@
 ///       → background thread wakes and calls ShutdownBlockReasonDestroy
 ///       → OS re-sends WM_QUERYENDSESSION; this time allow() → TRUE
 /// ```
+use std::cell::RefCell;
 use std::sync::{Arc, Condvar, Mutex};
 
 use windows::{
@@ -33,9 +34,10 @@ use windows::{
             Threading::SetProcessShutdownParameters,
         },
         UI::WindowsAndMessaging::{
-            CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
-            HMENU, MSG, PostMessageW, RegisterClassExW, TranslateMessage, UnregisterClassW, WM_APP,
-            WM_POWERBROADCAST, WM_QUERYENDSESSION, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+            CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DispatchMessageW, GWLP_USERDATA,
+            GetMessageW, GetWindowLongPtrW, MSG, PostMessageW, RegisterClassExW, SetWindowLongPtrW,
+            TranslateMessage, UnregisterClassW, WM_APP, WM_DESTROY, WM_NCCREATE, WM_POWERBROADCAST,
+            WM_QUERYENDSESSION, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
         },
     },
     core::{PCWSTR, w},
@@ -70,12 +72,6 @@ struct WindowState {
     last_network_up: Option<bool>,
 }
 
-// SAFETY: HWND is Send+Sync on Windows when used from the thread that created it.
-// All HWND usage is pinned to the message-loop thread; the raw pointer in
-// `shutdown_notify` is never dereferenced across threads.
-unsafe impl Send for WindowState {}
-unsafe impl Sync for WindowState {}
-
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 /// Start the Windows sentinel on a background thread.
@@ -96,21 +92,30 @@ unsafe fn run_message_loop(event_tx: EventSender) {
         // ── 1. Register a window class ──────────────────────────────────────
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW,
+            // No CS_HREDRAW/CS_VREDRAW — those only matter for visible windows.
+            style: Default::default(),
             lpfnWndProc: Some(wndproc),
             lpszClassName: CLASS_NAME,
             ..Default::default()
         };
-        RegisterClassExW(&wc);
+        let atom = RegisterClassExW(&wc);
+        assert!(
+            atom != 0,
+            "onebox_lifecycle: RegisterClassExW failed: {:?}",
+            windows::core::Error::from_thread()
+        );
 
         // ── 2. Create a message-only (hidden) window ────────────────────────
-        let state = Box::new(Mutex::new(WindowState {
+        // wndproc runs exclusively on this thread, so RefCell (not Mutex) is
+        // the correct primitive: single-threaded interior mutability with no
+        // locking overhead and no possibility of deadlocking the message pump.
+        let state = Box::new(RefCell::new(WindowState {
             event_tx,
             pending_shutdown_hwnd: None,
             shutdown_notify: None,
             last_network_up: None,
         }));
-        let state_ptr = Box::into_raw(state); // freed in WM_DESTROY
+        let state_ptr = Box::into_raw(state); // freed in WM_DESTROY or on loop exit
 
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW, // hidden from taskbar and Alt+Tab
@@ -122,7 +127,7 @@ unsafe fn run_message_loop(event_tx: EventSender) {
             0,
             0,
             None, // top-level window — receives WM_POWERBROADCAST & WM_QUERYENDSESSION
-            Some(HMENU::default()),
+            None, // no menu
             None,
             Some(state_ptr as *const _),
         )
@@ -159,7 +164,17 @@ unsafe fn run_message_loop(event_tx: EventSender) {
         }
 
         // ── 6. Cleanup ──────────────────────────────────────────────────────
+        // Reached only when WM_QUIT is posted.  WM_DESTROY (which also frees
+        // state_ptr) is dispatched only when DestroyWindow is called — in the
+        // current design that never happens, so we free the state here instead.
+        // If a future caller posts WM_QUIT *after* DestroyWindow, the state
+        // will already be null and Box::from_raw must not be called; guard that
+        // case by re-reading GWLP_USERDATA which WM_DESTROY zeroes out.
         let _ = CancelMibChangeNotify2(net_notify_handle);
+        let live_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut RefCell<WindowState>;
+        if !live_ptr.is_null() {
+            drop(Box::from_raw(live_ptr));
+        }
         let _ = UnregisterClassW(CLASS_NAME, None);
     }
 }
@@ -167,23 +182,34 @@ unsafe fn run_message_loop(event_tx: EventSender) {
 // ─── Window procedure ─────────────────────────────────────────────────────────
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CREATESTRUCTW, GWLP_USERDATA, GetWindowLongPtrW, SetWindowLongPtrW, WM_DESTROY, WM_NCCREATE,
-    };
-
+    // ── Stash state pointer on first call ────────────────────────────────────
     if msg == WM_NCCREATE {
-        unsafe {
-            let cs = &*(lparam.0 as *const CREATESTRUCTW);
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
-            return DefWindowProcW(hwnd, msg, wparam, lparam);
-        }
+        let cs = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize) };
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
 
-    let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Mutex<WindowState>;
+    let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut RefCell<WindowState>;
+
+    // ── Teardown: free state and zero GWLP_USERDATA to prevent double-free ──
+    if msg == WM_DESTROY {
+        if !state_ptr.is_null() {
+            // Zero the slot before dropping so the cleanup section in
+            // run_message_loop can detect that WM_DESTROY already ran.
+            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
+            drop(unsafe { Box::from_raw(state_ptr) });
+        }
+        return LRESULT(0);
+    }
+
     if state_ptr.is_null() {
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
-    let state_mutex = unsafe { &*state_ptr };
+
+    // SAFETY: state_ptr is valid for the lifetime of the window.  wndproc is
+    // only ever called from the message-loop thread (the same thread that
+    // created the Box), so RefCell's single-threaded invariant is upheld.
+    let state_cell = unsafe { &*state_ptr };
 
     match msg {
         // ── Shutdown query ──────────────────────────────────────────────────
@@ -195,10 +221,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             };
 
             {
-                let mut st = state_mutex.lock().unwrap();
+                let mut st = state_cell.borrow_mut();
                 st.pending_shutdown_hwnd = Some(hwnd);
                 st.event_tx.send(SystemEvent::ShuttingDown(handle));
-            }
+            } // borrow released before recv_timeout blocks
 
             // Wait up to 2 s for the caller to decide.  Default to blocking
             // (safer than silently allowing shutdown mid-cleanup).
@@ -210,7 +236,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
             match decision {
                 ShutdownDecision::Allow => {
-                    state_mutex.lock().unwrap().pending_shutdown_hwnd = None;
+                    state_cell.borrow_mut().pending_shutdown_hwnd = None;
                     LRESULT(1) // TRUE → allow
                 }
                 ShutdownDecision::Block { reason } => {
@@ -219,13 +245,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         .encode_utf16()
                         .chain(std::iter::once(0))
                         .collect();
+                    // ShutdownBlockReasonCreate copies the string internally;
+                    // `wide` can be dropped after this call.
                     let _ = unsafe { ShutdownBlockReasonCreate(hwnd, PCWSTR(wide.as_ptr())) };
 
                     // Set up a condvar so WM_SENTINEL_ALLOW_SHUTDOWN can wake
                     // the background thread without polling.
                     let notify = Arc::new((Mutex::new(false), Condvar::new()));
                     let notify_clone = Arc::clone(&notify);
-                    state_mutex.lock().unwrap().shutdown_notify = Some(notify);
+                    state_cell.borrow_mut().shutdown_notify = Some(notify);
 
                     // hwnd.0 is *mut c_void; cast to usize for Send across threads.
                     let hwnd_usize = hwnd.0 as usize;
@@ -251,7 +279,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
         // ── Async cleanup finished → signal the watcher thread ─────────────
         WM_SENTINEL_ALLOW_SHUTDOWN => {
-            let mut st = state_mutex.lock().unwrap();
+            let mut st = state_cell.borrow_mut();
             st.pending_shutdown_hwnd = None;
             if let Some(notify) = st.shutdown_notify.take() {
                 let (lock, cvar) = &*notify;
@@ -264,7 +292,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // ── Power events ────────────────────────────────────────────────────
         WM_POWERBROADCAST => {
             let event_code = wparam.0 as u32;
-            let st = state_mutex.lock().unwrap();
+            // send takes &self; immutable borrow is sufficient.
+            let st = state_cell.borrow();
             match event_code {
                 PBT_APMSUSPEND => st.event_tx.send(SystemEvent::WillSleep),
                 PBT_APMRESUMESUSPEND => st.event_tx.send(SystemEvent::DidWake),
@@ -276,7 +305,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // ── Network change (custom message posted by the OS callback) ───────
         WM_SENTINEL_NETWORK_CHANGE => {
             let up = wparam.0 != 0;
-            let mut st = state_mutex.lock().unwrap();
+            let mut st = state_cell.borrow_mut();
             if st.last_network_up != Some(up) {
                 st.last_network_up = Some(up);
                 if up {
@@ -285,12 +314,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     st.event_tx.send(SystemEvent::NetworkDown);
                 }
             }
-            LRESULT(0)
-        }
-
-        // ── Teardown ────────────────────────────────────────────────────────
-        WM_DESTROY => {
-            drop(unsafe { Box::from_raw(state_ptr) });
             LRESULT(0)
         }
 

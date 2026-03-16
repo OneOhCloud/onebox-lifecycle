@@ -1,9 +1,11 @@
 [package]
 name = "onebox_lifecycle"
-version = "0.1.0"
+version = "0.0.2"
 edition = "2024"
 description = "Cross-platform system lifecycle sentinel: shutdown blocking, sleep/wake, network events"
 license = "MIT"
+rust-version = "1.85"
+
 
 [features]
 default = []
