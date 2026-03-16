@@ -5,11 +5,13 @@
 /// then [`ShutdownHandle::allow`] once async cleanup has finished.
 ///
 /// Dropping the handle without calling either method defaults to *allowing* shutdown.
+#[cfg(feature = "shutdown")]
 pub struct ShutdownHandle {
     /// Wrapped in `Option` so that `Drop` can take ownership without `unsafe`.
     pub(crate) inner: Option<ShutdownHandleInner>,
 }
 
+#[cfg(feature = "shutdown")]
 pub(crate) enum ShutdownHandleInner {
     /// Resolved at construction time (e.g. macOS `replyToApplicationShouldTerminate:`).
     Mpsc(std::sync::mpsc::SyncSender<ShutdownDecision>),
@@ -18,6 +20,7 @@ pub(crate) enum ShutdownHandleInner {
     Tokio(tokio::sync::oneshot::Sender<ShutdownDecision>),
 }
 
+#[cfg(feature = "shutdown")]
 #[derive(Debug)]
 #[allow(dead_code)] // `reason` is read by the Windows backend
 pub(crate) enum ShutdownDecision {
@@ -25,6 +28,7 @@ pub(crate) enum ShutdownDecision {
     Block { reason: Option<String> },
 }
 
+#[cfg(feature = "shutdown")]
 impl ShutdownHandle {
     /// Tell the OS: "I'm not ready yet — please wait."
     ///
@@ -55,6 +59,7 @@ impl ShutdownHandle {
     }
 }
 
+#[cfg(feature = "shutdown")]
 impl Drop for ShutdownHandle {
     /// If the caller drops the handle without deciding, default to `Allow`.
     fn drop(&mut self) {
@@ -68,28 +73,42 @@ impl Drop for ShutdownHandle {
 #[non_exhaustive]
 pub enum SystemEvent {
     /// The system is about to suspend. Return quickly; you have very little time.
+    #[cfg(feature = "sleep")]
     WillSleep,
     /// The system has resumed from suspend.
+    #[cfg(feature = "sleep")]
     DidWake,
     /// A network interface has come up (at least one route is reachable).
+    #[cfg(feature = "network")]
     NetworkUp,
     /// All network interfaces are gone / unreachable.
+    #[cfg(feature = "network")]
     NetworkDown,
     /// The user (or system policy) has requested shutdown/logout/restart.
     ///
     /// Use [`ShutdownHandle::block`] to delay it while you do async cleanup,
     /// then [`ShutdownHandle::allow`] when ready.
+    #[cfg(feature = "shutdown")]
     ShuttingDown(ShutdownHandle),
 }
 
 impl std::fmt::Debug for SystemEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(feature = "sleep")]
             SystemEvent::WillSleep => write!(f, "WillSleep"),
+            #[cfg(feature = "sleep")]
             SystemEvent::DidWake => write!(f, "DidWake"),
+            #[cfg(feature = "network")]
             SystemEvent::NetworkUp => write!(f, "NetworkUp"),
+            #[cfg(feature = "network")]
             SystemEvent::NetworkDown => write!(f, "NetworkDown"),
+            #[cfg(feature = "shutdown")]
             SystemEvent::ShuttingDown(_) => write!(f, "ShuttingDown(<handle>)"),
+            // When some features are disabled, the enum may have no visible variants.
+            // The wildcard arm keeps the match exhaustive in all configurations.
+            #[allow(unreachable_patterns)]
+            _ => write!(f, "SystemEvent(<unknown>)"),
         }
     }
 }

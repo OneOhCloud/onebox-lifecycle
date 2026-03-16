@@ -17,42 +17,67 @@
 ///       → OS re-sends WM_QUERYENDSESSION; this time allow() → TRUE
 /// ```
 use std::cell::RefCell;
+#[cfg(feature = "shutdown")]
 use std::sync::{Arc, Condvar, Mutex};
 
 use windows::{
     Win32::{
-        Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM},
-        NetworkManagement::IpHelper::{
-            CancelMibChangeNotify2, NotifyNetworkConnectivityHintChange,
-        },
-        Networking::WinSock::{
-            NL_NETWORK_CONNECTIVITY_HINT, NetworkConnectivityLevelHintConstrainedInternetAccess,
-            NetworkConnectivityLevelHintInternetAccess,
-        },
-        System::{
-            Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy},
-            Threading::SetProcessShutdownParameters,
-        },
+        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
         UI::WindowsAndMessaging::{
             CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DispatchMessageW, GWLP_USERDATA,
-            GetMessageW, GetWindowLongPtrW, MSG, PostMessageW, RegisterClassExW, SetWindowLongPtrW,
-            TranslateMessage, UnregisterClassW, WM_APP, WM_DESTROY, WM_NCCREATE, WM_POWERBROADCAST,
-            WM_QUERYENDSESSION, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+            GetMessageW, GetWindowLongPtrW, MSG, RegisterClassExW, SetWindowLongPtrW,
+            TranslateMessage, UnregisterClassW, WM_DESTROY, WM_NCCREATE,
+            WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
         },
     },
     core::{PCWSTR, w},
 };
 
-use crate::common::{
-    EventSender, ShutdownDecision, ShutdownHandle, ShutdownHandleInner, SystemEvent,
+#[cfg(any(feature = "shutdown", feature = "network"))]
+use windows::Win32::{
+    Foundation::HANDLE,
+    UI::WindowsAndMessaging::{PostMessageW, WM_APP},
 };
 
+#[cfg(feature = "shutdown")]
+use windows::Win32::{
+    System::{
+        Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy},
+        Threading::SetProcessShutdownParameters,
+    },
+    UI::WindowsAndMessaging::WM_QUERYENDSESSION,
+};
+
+#[cfg(feature = "sleep")]
+use windows::Win32::UI::WindowsAndMessaging::WM_POWERBROADCAST;
+
+#[cfg(feature = "network")]
+use windows::Win32::{
+    NetworkManagement::IpHelper::{
+        CancelMibChangeNotify2, NotifyNetworkConnectivityHintChange,
+    },
+    Networking::WinSock::{
+        NL_NETWORK_CONNECTIVITY_HINT, NetworkConnectivityLevelHintConstrainedInternetAccess,
+        NetworkConnectivityLevelHintInternetAccess,
+    },
+};
+
+use crate::common::EventSender;
+#[cfg(any(feature = "shutdown", feature = "sleep", feature = "network"))]
+use crate::common::SystemEvent;
+#[cfg(feature = "shutdown")]
+use crate::common::{ShutdownDecision, ShutdownHandle, ShutdownHandleInner};
+
 // Custom messages sent back to the hidden window from other threads/callbacks.
+#[cfg(feature = "shutdown")]
 const WM_SENTINEL_ALLOW_SHUTDOWN: u32 = WM_APP + 1;
+#[cfg(feature = "network")]
 const WM_SENTINEL_NETWORK_CHANGE: u32 = WM_APP + 2;
 
 // These power-event codes are not re-exported as named constants in windows-rs.
+#[cfg(feature = "sleep")]
 const PBT_APMSUSPEND: u32 = 4;
+#[cfg(feature = "sleep")]
 const PBT_APMRESUMESUSPEND: u32 = 7;
 
 // Compile-time UTF-16 class name — no heap allocation.
@@ -63,12 +88,15 @@ const CLASS_NAME: PCWSTR = w!("SysSentinelHidden");
 struct WindowState {
     event_tx: EventSender,
     /// Set while we are blocking a pending shutdown query.
+    #[cfg(feature = "shutdown")]
     pending_shutdown_hwnd: Option<HWND>,
     /// Signals the background watcher thread that `allow()` has been called,
     /// so it can invoke `ShutdownBlockReasonDestroy` and exit.
+    #[cfg(feature = "shutdown")]
     shutdown_notify: Option<Arc<(Mutex<bool>, Condvar)>>,
     /// Last known network reachability; `None` means not yet delivered.
     /// Used to suppress duplicate NetworkUp/NetworkDown events.
+    #[cfg(feature = "network")]
     last_network_up: Option<bool>,
 }
 
@@ -111,8 +139,11 @@ unsafe fn run_message_loop(event_tx: EventSender) {
         // locking overhead and no possibility of deadlocking the message pump.
         let state = Box::new(RefCell::new(WindowState {
             event_tx,
+            #[cfg(feature = "shutdown")]
             pending_shutdown_hwnd: None,
+            #[cfg(feature = "shutdown")]
             shutdown_notify: None,
+            #[cfg(feature = "network")]
             last_network_up: None,
         }));
         let state_ptr = Box::into_raw(state); // freed in WM_DESTROY or on loop exit
@@ -134,23 +165,30 @@ unsafe fn run_message_loop(event_tx: EventSender) {
         .expect("onebox_lifecycle: CreateWindowExW failed");
 
         // ── 3. Prioritise shutdown notification ─────────────────────────────
-        // Level 0x3FF = 1023: our process is notified before most user apps.
-        // Flags = 0: SHUTDOWN_NORETRY is NOT set (we want OS to retry after we unblock).
-        let _ = SetProcessShutdownParameters(0x3FF, 0);
+        #[cfg(feature = "shutdown")]
+        {
+            // Level 0x3FF = 1023: our process is notified before most user apps.
+            // Flags = 0: SHUTDOWN_NORETRY is NOT set (we want OS to retry after we unblock).
+            let _ = SetProcessShutdownParameters(0x3FF, 0);
+        }
 
         // ── 4. Register NCSI connectivity-hint change callback ──────────────
-        // NotifyNetworkConnectivityHintChange fires when Windows NCSI flips
-        // between None / LocalAccess / InternetAccess, matching the taskbar
-        // network icon.  initialnotification=true delivers the current state
-        // immediately so last_network_up is set before the first real change.
-        let mut net_notify_handle: HANDLE = std::mem::zeroed();
-        let _ = NotifyNetworkConnectivityHintChange(
-            Some(net_change_callback),
-            // Pass HWND.0 (*mut c_void) as the opaque context pointer.
-            Some(hwnd.0 as *const _),
-            true, // deliver current state immediately
-            &mut net_notify_handle,
-        );
+        #[cfg(feature = "network")]
+        let net_notify_handle = {
+            // NotifyNetworkConnectivityHintChange fires when Windows NCSI flips
+            // between None / LocalAccess / InternetAccess, matching the taskbar
+            // network icon.  initialnotification=true delivers the current state
+            // immediately so last_network_up is set before the first real change.
+            let mut handle: HANDLE = std::mem::zeroed();
+            let _ = NotifyNetworkConnectivityHintChange(
+                Some(net_change_callback),
+                // Pass HWND.0 (*mut c_void) as the opaque context pointer.
+                Some(hwnd.0 as *const _),
+                true, // deliver current state immediately
+                &mut handle,
+            );
+            handle
+        };
 
         // ── 5. Pump messages ────────────────────────────────────────────────
         let mut msg = MSG::default();
@@ -170,7 +208,10 @@ unsafe fn run_message_loop(event_tx: EventSender) {
         // If a future caller posts WM_QUIT *after* DestroyWindow, the state
         // will already be null and Box::from_raw must not be called; guard that
         // case by re-reading GWLP_USERDATA which WM_DESTROY zeroes out.
-        let _ = CancelMibChangeNotify2(net_notify_handle);
+        #[cfg(feature = "network")]
+        {
+            let _ = CancelMibChangeNotify2(net_notify_handle);
+        }
         let live_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut RefCell<WindowState>;
         if !live_ptr.is_null() {
             drop(Box::from_raw(live_ptr));
@@ -213,6 +254,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
     match msg {
         // ── Shutdown query ──────────────────────────────────────────────────
+        #[cfg(feature = "shutdown")]
         WM_QUERYENDSESSION => {
             let (decision_tx, decision_rx) = std::sync::mpsc::sync_channel::<ShutdownDecision>(1);
 
@@ -278,6 +320,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
 
         // ── Async cleanup finished → signal the watcher thread ─────────────
+        #[cfg(feature = "shutdown")]
         WM_SENTINEL_ALLOW_SHUTDOWN => {
             let mut st = state_cell.borrow_mut();
             st.pending_shutdown_hwnd = None;
@@ -290,6 +333,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
 
         // ── Power events ────────────────────────────────────────────────────
+        #[cfg(feature = "sleep")]
         WM_POWERBROADCAST => {
             let event_code = wparam.0 as u32;
             // send takes &self; immutable borrow is sufficient.
@@ -303,6 +347,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
 
         // ── Network change (custom message posted by the OS callback) ───────
+        #[cfg(feature = "network")]
         WM_SENTINEL_NETWORK_CHANGE => {
             let up = wparam.0 != 0;
             let mut st = state_cell.borrow_mut();
@@ -323,6 +368,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
 // ─── Network change callback (called by the OS on a system thread) ────────────
 
+#[cfg(feature = "network")]
 unsafe extern "system" fn net_change_callback(
     caller_context: *const core::ffi::c_void,
     hint: NL_NETWORK_CONNECTIVITY_HINT,
@@ -352,6 +398,7 @@ unsafe extern "system" fn net_change_callback(
 /// and the next [`ShutdownHandle::allow`] call will return `TRUE`.
 ///
 /// Equivalent to `[NSApp replyToApplicationShouldTerminate: YES]` on macOS.
+#[cfg(feature = "shutdown")]
 #[allow(dead_code)]
 pub fn post_allow_shutdown(hwnd: HWND) {
     unsafe {

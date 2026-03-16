@@ -8,7 +8,10 @@ rust-version = "1.85"
 
 
 [features]
-default = []
+default = ["shutdown", "sleep", "network"]
+shutdown = []
+sleep = []
+network = []
 tokio = ["dep:tokio"]
 
 [dependencies]
@@ -46,5 +49,5 @@ tokio = { version = "1", features = ["full"] }
 
 [[example]]
 name = "demo_full"
-required-features = []
+required-features = ["shutdown", "sleep", "network"]
 

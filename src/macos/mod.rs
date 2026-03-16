@@ -21,33 +21,56 @@
 /// Uses `NWPathMonitor` (Network.framework, macOS 10.14+) — no polling, no
 /// TCP probes.  The monitor delivers an initial snapshot synchronously after
 /// `nw_path_monitor_start`, then fires again on every reachability change.
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(any(feature = "shutdown", feature = "network"))]
+use std::sync::Mutex;
 
+#[cfg(feature = "network")]
 use block2::RcBlock;
-use objc2::rc::{Retained, autoreleasepool};
-use objc2::runtime::{AnyObject, Sel};
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
+#[cfg(any(feature = "shutdown", feature = "sleep"))]
+use objc2::rc::Retained;
+#[cfg(feature = "sleep")]
+use objc2::rc::autoreleasepool;
+#[cfg(any(feature = "shutdown", feature = "sleep"))]
+use objc2::runtime::AnyObject;
+#[cfg(feature = "shutdown")]
+use objc2::runtime::Sel;
+use objc2::MainThreadMarker;
+#[cfg(any(feature = "shutdown", feature = "sleep"))]
+use objc2::msg_send;
+#[cfg(any(feature = "shutdown", feature = "sleep"))]
+use objc2::{DefinedClass, MainThreadOnly, define_class};
+#[cfg(feature = "shutdown")]
 use objc2_app_kit::{NSApplication, NSApplicationTerminateReply};
-use objc2_foundation::{NSObject, NSString};
+#[cfg(any(feature = "shutdown", feature = "sleep"))]
+use objc2_foundation::NSObject;
+#[cfg(feature = "sleep")]
+use objc2_foundation::NSString;
 
-use crate::common::{
-    EventSender, ShutdownDecision, ShutdownHandle, ShutdownHandleInner, SystemEvent,
-};
+use crate::common::EventSender;
+#[cfg(any(feature = "shutdown", feature = "sleep", feature = "network"))]
+use crate::common::SystemEvent;
+#[cfg(feature = "shutdown")]
+use crate::common::{ShutdownDecision, ShutdownHandle, ShutdownHandleInner};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 /// Maximum time the caller has to finish async cleanup before shutdown is
 /// allowed anyway.
+#[cfg(feature = "shutdown")]
 const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// `NSWorkspaceWillSleepNotification` — posted before the system sleeps.
+#[cfg(feature = "sleep")]
 const WILL_SLEEP_NOTIFICATION: &str = "NSWorkspaceWillSleepNotification";
 
 /// `NSWorkspaceDidWakeNotification` — posted after the system wakes.
+#[cfg(feature = "sleep")]
 const DID_WAKE_NOTIFICATION: &str = "NSWorkspaceDidWakeNotification";
 
-// ─── Delegate state ───────────────────────────────────────────────────────────
+// ─── Delegate state (shutdown) ────────────────────────────────────────────────
 
+#[cfg(feature = "shutdown")]
 struct DelegateState {
     event_tx: Arc<EventSender>,
     /// The NSApplicationDelegate that was installed before us (e.g. Tauri's
@@ -59,10 +82,12 @@ struct DelegateState {
 
 // SAFETY: delegate callbacks always arrive on the main thread; we never free
 // the pointer, only call Obj-C methods on it from the same thread.
+#[cfg(feature = "shutdown")]
 unsafe impl Send for DelegateState {}
 
-// ─── NSApplicationDelegate ────────────────────────────────────────────────────
+// ─── NSApplicationDelegate (shutdown) ─────────────────────────────────────────
 
+#[cfg(feature = "shutdown")]
 define_class!(
     // SAFETY: NSObject subclassing requirements are met.
     //         The struct does not implement Drop.
@@ -157,6 +182,7 @@ define_class!(
     }
 );
 
+#[cfg(feature = "shutdown")]
 impl SentinelDelegate {
     fn new(mtm: MainThreadMarker, state: Arc<Mutex<DelegateState>>) -> Retained<Self> {
         let this = mtm.alloc::<Self>().set_ivars(state);
@@ -164,8 +190,9 @@ impl SentinelDelegate {
     }
 }
 
-// ─── Power observer ───────────────────────────────────────────────────────────
+// ─── Power observer (sleep/wake) ─────────────────────────────────────────────
 
+#[cfg(feature = "sleep")]
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
@@ -187,6 +214,7 @@ define_class!(
     }
 );
 
+#[cfg(feature = "sleep")]
 impl PowerObserver {
     fn new(mtm: MainThreadMarker, event_tx: Arc<EventSender>) -> Retained<Self> {
         let this = mtm.alloc::<Self>().set_ivars(event_tx);
@@ -194,7 +222,7 @@ impl PowerObserver {
     }
 }
 
-// ─── Notification observer guard ─────────────────────────────────────────────
+// ─── Notification observer guard (sleep/wake) ────────────────────────────────
 
 /// RAII guard that calls `[NSNotificationCenter removeObserver:]` when dropped,
 /// preventing stale callbacks if the observer is ever released before the
@@ -203,12 +231,14 @@ impl PowerObserver {
 /// `NSNotificationCenter` retains observers since macOS 10.x, so failing to
 /// call `removeObserver:` keeps the object alive indefinitely (memory leak) and
 /// may deliver callbacks to a logically-dead observer.
+#[cfg(feature = "sleep")]
 struct NotificationObserverGuard {
     /// Non-owning pointer to the `PowerObserver`.  The object is kept alive by
     /// `MacosGuard._power_observer`; this guard must be dropped first.
     observer: *const NSObject,
 }
 
+#[cfg(feature = "sleep")]
 impl Drop for NotificationObserverGuard {
     fn drop(&mut self) {
         // SAFETY: `NSWorkspace.sharedWorkspace` and its notification centre are
@@ -223,91 +253,100 @@ impl Drop for NotificationObserverGuard {
 }
 
 // SAFETY: `removeObserver:` on NSNotificationCenter is thread-safe.
+#[cfg(feature = "sleep")]
 unsafe impl Send for NotificationObserverGuard {}
+#[cfg(feature = "sleep")]
 unsafe impl Sync for NotificationObserverGuard {}
 
-// ─── NWPathMonitor FFI ────────────────────────────────────────────────────────
+// ─── NWPathMonitor FFI (network) ─────────────────────────────────────────────
 //
 // Network.framework exposes a C API since macOS 10.14 / iOS 12.
 // nw_* objects are reference-counted via nw_retain / nw_release (not ObjC ARC).
 
-/// Opaque handle to a `nw_path_monitor_t`.
-type NwPathMonitorT = *mut std::ffi::c_void;
+#[cfg(feature = "network")]
+mod nw_ffi {
+    /// Opaque handle to a `nw_path_monitor_t`.
+    pub type NwPathMonitorT = *mut std::ffi::c_void;
 
-/// Opaque handle to a `nw_path_t` (passed into the update-handler block).
-type NwPathT = *mut std::ffi::c_void;
+    /// Opaque handle to a `nw_path_t` (passed into the update-handler block).
+    pub type NwPathT = *mut std::ffi::c_void;
 
-/// `nw_path_status_satisfied` — at least one interface can carry traffic.
-const NW_PATH_STATUS_SATISFIED: u32 = 1;
+    /// `nw_path_status_satisfied` — at least one interface can carry traffic.
+    pub const NW_PATH_STATUS_SATISFIED: u32 = 1;
 
-// Network.framework C API
-// SAFETY: the function signatures match the Apple-published headers exactly.
-#[link(name = "Network", kind = "framework")]
-unsafe extern "C" {
-    /// Create a new path monitor that observes all available interfaces.
-    fn nw_path_monitor_create() -> NwPathMonitorT;
+    // Network.framework C API
+    // SAFETY: the function signatures match the Apple-published headers exactly.
+    #[link(name = "Network", kind = "framework")]
+    unsafe extern "C" {
+        /// Create a new path monitor that observes all available interfaces.
+        pub fn nw_path_monitor_create() -> NwPathMonitorT;
 
-    /// Set the handler block called on every path change.
-    ///
-    /// The monitor copies (retains) the block internally.
-    fn nw_path_monitor_set_update_handler(
-        monitor: NwPathMonitorT,
-        // `void (^update_handler)(nw_path_t path)`
-        update_handler: *const block2::Block<dyn Fn(NwPathT)>,
-    );
+        /// Set the handler block called on every path change.
+        ///
+        /// The monitor copies (retains) the block internally.
+        pub fn nw_path_monitor_set_update_handler(
+            monitor: NwPathMonitorT,
+            // `void (^update_handler)(nw_path_t path)`
+            update_handler: *const block2::Block<dyn Fn(NwPathT)>,
+        );
 
-    /// Set the dispatch queue on which the handler is invoked.
-    fn nw_path_monitor_set_queue(monitor: NwPathMonitorT, queue: *mut std::ffi::c_void);
+        /// Set the dispatch queue on which the handler is invoked.
+        pub fn nw_path_monitor_set_queue(monitor: NwPathMonitorT, queue: *mut std::ffi::c_void);
 
-    /// Start observing.  Delivers the current path immediately.
-    fn nw_path_monitor_start(monitor: NwPathMonitorT);
+        /// Start observing.  Delivers the current path immediately.
+        pub fn nw_path_monitor_start(monitor: NwPathMonitorT);
 
-    /// Stop observing and release OS resources.
-    fn nw_path_monitor_cancel(monitor: NwPathMonitorT);
+        /// Stop observing and release OS resources.
+        pub fn nw_path_monitor_cancel(monitor: NwPathMonitorT);
 
-    /// Query the satisfaction status of a `nw_path_t`.
-    fn nw_path_get_status(path: NwPathT) -> u32; // nw_path_status_t
+        /// Query the satisfaction status of a `nw_path_t`.
+        pub fn nw_path_get_status(path: NwPathT) -> u32; // nw_path_status_t
 
-    /// Release a reference to any `nw_object_t` (includes `nw_path_monitor_t`).
-    fn nw_release(obj: *mut std::ffi::c_void);
+        /// Release a reference to any `nw_object_t` (includes `nw_path_monitor_t`).
+        pub fn nw_release(obj: *mut std::ffi::c_void);
+    }
+
+    // GCD — in libSystem, always linked on macOS.
+    unsafe extern "C" {
+        /// Returns the global concurrent queue at the given QoS class.
+        /// Pass `0` for `QOS_CLASS_DEFAULT`.
+        pub fn dispatch_get_global_queue(
+            identifier: std::ffi::c_long,
+            flags: std::ffi::c_ulong,
+        ) -> *mut std::ffi::c_void;
+    }
 }
 
-// GCD — in libSystem, always linked on macOS.
-unsafe extern "C" {
-    /// Returns the global concurrent queue at the given QoS class.
-    /// Pass `0` for `QOS_CLASS_DEFAULT`.
-    fn dispatch_get_global_queue(
-        identifier: std::ffi::c_long,
-        flags: std::ffi::c_ulong,
-    ) -> *mut std::ffi::c_void;
-}
-
-// ─── PathMonitorGuard ─────────────────────────────────────────────────────────
+// ─── PathMonitorGuard (network) ──────────────────────────────────────────────
 
 /// RAII wrapper — cancels and releases the monitor when dropped.
+#[cfg(feature = "network")]
 struct PathMonitorGuard {
-    monitor: NwPathMonitorT,
+    monitor: nw_ffi::NwPathMonitorT,
     /// Kept alive so the closure's captures (Arc<EventSender>) survive for the
     /// monitor's lifetime.  The monitor also retains the block internally.
-    _block: RcBlock<dyn Fn(NwPathT)>,
+    _block: RcBlock<dyn Fn(nw_ffi::NwPathT)>,
 }
 
+#[cfg(feature = "network")]
 impl Drop for PathMonitorGuard {
     fn drop(&mut self) {
         // SAFETY: monitor was created by nw_path_monitor_create and has not
         //         been cancelled before.
         unsafe {
-            nw_path_monitor_cancel(self.monitor);
-            nw_release(self.monitor);
+            nw_ffi::nw_path_monitor_cancel(self.monitor);
+            nw_ffi::nw_release(self.monitor);
         }
     }
 }
 
 // SAFETY: nw_path_monitor_t is thread-safe per Apple's Network.framework docs.
+#[cfg(feature = "network")]
 unsafe impl Send for PathMonitorGuard {}
+#[cfg(feature = "network")]
 unsafe impl Sync for PathMonitorGuard {}
 
-// ─── NWPathMonitor constructor ────────────────────────────────────────────────
+// ─── NWPathMonitor constructor (network) ─────────────────────────────────────
 
 /// Start a `NWPathMonitor` and forward reachability changes to `event_tx`.
 ///
@@ -318,7 +357,10 @@ unsafe impl Sync for PathMonitorGuard {}
 /// Change detection: events are only emitted when the satisfied-status
 /// actually changes, or on the very first delivery (so callers know the
 /// initial state).
+#[cfg(feature = "network")]
 fn start_nw_path_monitor(event_tx: Arc<EventSender>) -> PathMonitorGuard {
+    use nw_ffi::*;
+
     // `None` = "never seen before" — first delivery always emits an event.
     let last_seen: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
 
@@ -374,18 +416,26 @@ fn start_nw_path_monitor(event_tx: Arc<EventSender>) -> PathMonitorGuard {
 // ─── MacosGuard ───────────────────────────────────────────────────────────────
 
 pub struct MacosGuard {
+    #[cfg(feature = "shutdown")]
     _delegate: Retained<SentinelDelegate>,
+    #[cfg(feature = "sleep")]
     _power_observer: Retained<PowerObserver>,
     /// Removes `NSNotificationCenter` observers before `_power_observer` drops.
     /// Field order guarantees this drops first (Rust drops fields top-to-bottom).
+    #[cfg(feature = "sleep")]
     _notification_guard: NotificationObserverGuard,
     /// Cancels NWPathMonitor on drop.
+    #[cfg(feature = "network")]
     _path_monitor: PathMonitorGuard,
 }
 
 impl MacosGuard {
     /// Install all listeners.  **Must be called from the main thread.**
     pub fn new(event_tx: EventSender) -> Self {
+        // Network-only builds don't reference `mtm` directly, but we still
+        // assert main-thread for safety (NWPathMonitor setup is documented to
+        // be safe from any thread, but future features may not be).
+        #[allow(unused_variables)]
         let mtm = MainThreadMarker::new()
             .expect("onebox_lifecycle: MacosGuard::new() must be called from the main thread");
 
@@ -393,60 +443,72 @@ impl MacosGuard {
         // and the path-monitor block without cloning the channel sender.
         let event_tx = Arc::new(event_tx);
 
-        // ── 1. Install the NSApplication delegate ─────────────────────────
-        // Capture the existing delegate first so we can forward messages to it.
-        let previous_delegate: *mut AnyObject = unsafe {
-            let app = NSApplication::sharedApplication(mtm);
-            msg_send![&*app, delegate]
+        // ── 1. Install the NSApplication delegate (shutdown) ────────────
+        #[cfg(feature = "shutdown")]
+        let _delegate = {
+            // Capture the existing delegate first so we can forward messages to it.
+            let previous_delegate: *mut AnyObject = unsafe {
+                let app = NSApplication::sharedApplication(mtm);
+                msg_send![&*app, delegate]
+            };
+
+            let delegate_state = Arc::new(Mutex::new(DelegateState {
+                event_tx: Arc::clone(&event_tx),
+                previous_delegate,
+            }));
+
+            let delegate = SentinelDelegate::new(mtm, delegate_state);
+            unsafe {
+                let app = NSApplication::sharedApplication(mtm);
+                let delegate_obj = Retained::as_ptr(&delegate) as *const NSObject;
+                let _: () = msg_send![&*app, setDelegate: delegate_obj];
+            }
+            delegate
         };
 
-        let delegate_state = Arc::new(Mutex::new(DelegateState {
-            event_tx: Arc::clone(&event_tx),
-            previous_delegate,
-        }));
+        // ── 2. NSWorkspace sleep / wake notifications ───────────────────
+        #[cfg(feature = "sleep")]
+        let (_power_observer, _notification_guard) = {
+            let power_observer = PowerObserver::new(mtm, Arc::clone(&event_tx));
+            let notification_guard = autoreleasepool(|_pool| unsafe {
+                let workspace: *mut AnyObject = msg_send![objc2::class!(NSWorkspace), sharedWorkspace];
+                let nc: *mut AnyObject = msg_send![workspace, notificationCenter];
 
-        let delegate = SentinelDelegate::new(mtm, delegate_state);
-        unsafe {
-            let app = NSApplication::sharedApplication(mtm);
-            let delegate_obj = Retained::as_ptr(&delegate) as *const NSObject;
-            let _: () = msg_send![&*app, setDelegate: delegate_obj];
-        }
+                let will_sleep = NSString::from_str(WILL_SLEEP_NOTIFICATION);
+                let did_wake = NSString::from_str(DID_WAKE_NOTIFICATION);
+                let observer = Retained::as_ptr(&power_observer) as *const NSObject;
 
-        // ── 2. NSWorkspace sleep / wake notifications ──────────────────────
-        let power_observer = PowerObserver::new(mtm, Arc::clone(&event_tx));
-        let notification_guard = autoreleasepool(|_pool| unsafe {
-            let workspace: *mut AnyObject = msg_send![objc2::class!(NSWorkspace), sharedWorkspace];
-            let nc: *mut AnyObject = msg_send![workspace, notificationCenter];
+                let _: () = msg_send![nc,
+                    addObserver: observer,
+                    selector: objc2::sel!(handleWillSleep:),
+                    name: &*will_sleep,
+                    object: std::ptr::null::<AnyObject>()
+                ];
+                let _: () = msg_send![nc,
+                    addObserver: observer,
+                    selector: objc2::sel!(handleDidWake:),
+                    name: &*did_wake,
+                    object: std::ptr::null::<AnyObject>()
+                ];
 
-            let will_sleep = NSString::from_str(WILL_SLEEP_NOTIFICATION);
-            let did_wake = NSString::from_str(DID_WAKE_NOTIFICATION);
-            let observer = Retained::as_ptr(&power_observer) as *const NSObject;
+                NotificationObserverGuard { observer }
+            });
+            (power_observer, notification_guard)
+        };
 
-            let _: () = msg_send![nc,
-                addObserver: observer,
-                selector: objc2::sel!(handleWillSleep:),
-                name: &*will_sleep,
-                object: std::ptr::null::<AnyObject>()
-            ];
-            let _: () = msg_send![nc,
-                addObserver: observer,
-                selector: objc2::sel!(handleDidWake:),
-                name: &*did_wake,
-                object: std::ptr::null::<AnyObject>()
-            ];
-
-            NotificationObserverGuard { observer }
-        });
-
-        // ── 3. NWPathMonitor (Network.framework, macOS 10.14+) ────────────
-        let path_monitor = start_nw_path_monitor(Arc::clone(&event_tx));
+        // ── 3. NWPathMonitor (Network.framework, macOS 10.14+) ──────────
+        #[cfg(feature = "network")]
+        let _path_monitor = start_nw_path_monitor(Arc::clone(&event_tx));
 
         MacosGuard {
-            _delegate: delegate,
-            _power_observer: power_observer,
-            // Drops before _power_observer (field declaration order).
-            _notification_guard: notification_guard,
-            _path_monitor: path_monitor,
+            #[cfg(feature = "shutdown")]
+            _delegate,
+            #[cfg(feature = "sleep")]
+            _power_observer,
+            #[cfg(feature = "sleep")]
+            _notification_guard,
+            #[cfg(feature = "network")]
+            _path_monitor,
         }
     }
 }
@@ -459,6 +521,7 @@ impl MacosGuard {
 /// thread — it only posts a Mach message internally and has no UI side-effects
 /// that require the main thread.  We therefore call it directly from the
 /// background waiter thread without dispatching to the main queue.
+#[cfg(feature = "shutdown")]
 fn reply_to_should_terminate(proceed: bool) {
     // SAFETY: `replyToApplicationShouldTerminate:` is thread-safe per Apple
     // documentation.  We bypass the `MainThreadMarker` guard on

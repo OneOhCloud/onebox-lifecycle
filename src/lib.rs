@@ -62,12 +62,20 @@
 //! ```
 
 pub(crate) mod common;
-pub use common::{EventReceiver, EventSender, ShutdownHandle, SystemEvent};
+pub use common::{EventReceiver, EventSender, SystemEvent};
+#[cfg(feature = "shutdown")]
+pub use common::ShutdownHandle;
 
-#[cfg(target_os = "windows")]
+#[cfg(all(
+    target_os = "windows",
+    any(feature = "shutdown", feature = "sleep", feature = "network")
+))]
 mod windows;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(
+    target_os = "macos",
+    any(feature = "shutdown", feature = "sleep", feature = "network")
+))]
 mod macos;
 
 // ─── Platform-agnostic facade ─────────────────────────────────────────────────
@@ -76,7 +84,10 @@ mod macos;
 pub struct Sentinel {
     rx: EventReceiver,
     /// Keeps platform-specific resources alive.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(
+        target_os = "macos",
+        any(feature = "shutdown", feature = "sleep", feature = "network")
+    ))]
     _guard: macos::MacosGuard,
 }
 
@@ -90,21 +101,30 @@ impl Sentinel {
     pub fn start() -> Self {
         let (tx, rx) = common::channel();
 
-        #[cfg(target_os = "windows")]
+        #[cfg(all(
+            target_os = "windows",
+            any(feature = "shutdown", feature = "sleep", feature = "network")
+        ))]
         {
             windows::start(tx);
             Sentinel { rx }
         }
 
-        #[cfg(target_os = "macos")]
+        #[cfg(all(
+            target_os = "macos",
+            any(feature = "shutdown", feature = "sleep", feature = "network")
+        ))]
         {
             let guard = macos::MacosGuard::new(tx);
             Sentinel { rx, _guard: guard }
         }
 
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        #[cfg(not(all(
+            any(target_os = "windows", target_os = "macos"),
+            any(feature = "shutdown", feature = "sleep", feature = "network")
+        )))]
         {
-            drop(tx); // unsupported platform — channel will immediately return None
+            drop(tx); // unsupported platform or no features — channel returns None immediately
             Sentinel { rx }
         }
     }
@@ -130,7 +150,10 @@ impl Sentinel {
     /// framework (e.g. Tauri) that already runs its own `NSApplication` event
     /// loop on the main thread.
     pub fn into_receiver(self) -> EventReceiver {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(
+            target_os = "macos",
+            any(feature = "shutdown", feature = "sleep", feature = "network")
+        ))]
         {
             let (rx, guard) = (self.rx, self._guard);
             // Forget the guard: NSApplication retains the delegate, NSNotificationCenter
@@ -139,7 +162,10 @@ impl Sentinel {
             std::mem::forget(guard);
             rx
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(
+            target_os = "macos",
+            any(feature = "shutdown", feature = "sleep", feature = "network")
+        )))]
         {
             self.rx
         }
