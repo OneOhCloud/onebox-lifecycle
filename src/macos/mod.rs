@@ -104,10 +104,28 @@ define_class!(
             NSApplicationTerminateReply::TerminateLater
         }
 
-        /// Transparent proxy: forward any delegate message we don't implement
-        /// to the previous delegate.  This covers `application:openURLs:` for
-        /// deep links, `applicationDidFinishLaunching:`, and every other
-        /// optional NSApplicationDelegate method — without enumerating them.
+        /// Hot-start deep-link entry point on macOS.
+        ///
+        /// AppKit calls this when a URL is opened while the app is already
+        /// running.  WRY / Tauri listen for `application:openURLs:` on the
+        /// NSApplicationDelegate to generate `RunEvent::Opened`, which is what
+        /// drives `tauri-plugin-deep-link`'s `on_open_url` callbacks.
+        ///
+        /// We cannot rely solely on `forwardingTargetForSelector:` here because
+        /// WRY may register the method via `class_addMethod` at runtime, which
+        /// can cause `[prev respondsToSelector:]` to return `NO` even when the
+        /// method exists, silently breaking the forwarding chain.  Implementing
+        /// the method **directly** guarantees AppKit always invokes it.
+        #[unsafe(method(application:openURLs:))]
+        fn application_open_urls(&self, application: *mut AnyObject, urls: *mut AnyObject) {
+            let prev = self.ivars().lock().unwrap().previous_delegate;
+            if !prev.is_null() {
+                unsafe { let _: () = msg_send![prev, application: application, openURLs: urls]; }
+            }
+        }
+
+        /// Transparent proxy: forward any other delegate message we don't
+        /// implement directly to the previous delegate.
         #[unsafe(method(forwardingTargetForSelector:))]
         fn forwarding_target_for_selector(&self, sel: Sel) -> *mut AnyObject {
             let prev = self.ivars().lock().unwrap().previous_delegate;
