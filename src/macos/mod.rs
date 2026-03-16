@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use block2::RcBlock;
 use objc2::rc::{Retained, autoreleasepool};
-use objc2::runtime::AnyObject;
+use objc2::runtime::{AnyObject, Sel};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{NSApplication, NSApplicationTerminateReply};
 use objc2_foundation::{NSObject, NSString};
@@ -38,9 +38,15 @@ use crate::common::{
 
 struct SentinelState {
     event_tx: EventSender,
+    /// The NSApplicationDelegate that was installed before us (e.g. Tauri's
+    /// deep-link delegate).  Kept as a raw pointer because the previous owner
+    /// (Tauri / AppKit) retains it for the process lifetime.
+    /// null if there was no prior delegate.
+    previous_delegate: *mut AnyObject,
 }
 
-// EventSender wraps mpsc::SyncSender which is Send.
+// SAFETY: delegate callbacks always arrive on the main thread; we never
+// free the pointer, only call Obj-C methods on it from the same thread.
 unsafe impl Send for SentinelState {}
 
 // ─── NSApplicationDelegate ────────────────────────────────────────────────────
@@ -85,6 +91,39 @@ define_class!(
 
             // TerminateLater — AppKit will wait for our explicit reply.
             NSApplicationTerminateReply::TerminateLater
+        }
+
+        /// Transparent proxy: forward any delegate message we don't implement
+        /// to the previous delegate.  This covers `application:openURLs:` for
+        /// deep links, `applicationDidFinishLaunching:`, and every other
+        /// optional NSApplicationDelegate method — without enumerating them.
+        #[unsafe(method(forwardingTargetForSelector:))]
+        fn forwarding_target_for_selector(&self, sel: Sel) -> *mut AnyObject {
+            let prev = self.ivars().lock().unwrap().previous_delegate;
+            if !prev.is_null() {
+                let responds: bool = unsafe { msg_send![prev, respondsToSelector: sel] };
+                if responds {
+                    return prev;
+                }
+            }
+            std::ptr::null_mut()
+        }
+
+        /// Report our effective capabilities: own methods + whatever the
+        /// previous delegate supports.  AppKit checks this before sending
+        /// optional delegate messages, so it must return `true` for any
+        /// selector the previous delegate handles (e.g. `application:openURLs:`).
+        #[unsafe(method(respondsToSelector:))]
+        fn responds_to_selector(&self, sel: Sel) -> bool {
+            let self_responds: bool =
+                unsafe { msg_send![super(self), respondsToSelector: sel] };
+            if self_responds {
+                return true.into();
+            }
+            let prev = self.ivars().lock().unwrap().previous_delegate;
+            let prev_responds: bool =
+                !prev.is_null() && unsafe { msg_send![prev, respondsToSelector: sel] };
+            prev_responds.into()
         }
     }
 );
@@ -289,9 +328,15 @@ impl MacosGuard {
         let mtm = MainThreadMarker::new()
             .expect("onebox_lifecycle: MacosGuard::new() must be called from the main thread");
 
-        let state = Arc::new(Mutex::new(SentinelState { event_tx }));
-
         // ── 1. Install the NSApplication delegate ─────────────────────────
+        // Capture the existing delegate first so we can forward messages to it.
+        let previous_delegate: *mut AnyObject = unsafe {
+            let app = NSApplication::sharedApplication(mtm);
+            msg_send![&*app, delegate]
+        };
+
+        let state = Arc::new(Mutex::new(SentinelState { event_tx, previous_delegate }));
+
         let delegate = SentinelDelegate::new(mtm, Arc::clone(&state));
         unsafe {
             let app = NSApplication::sharedApplication(mtm);
