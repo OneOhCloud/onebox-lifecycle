@@ -8,8 +8,10 @@ Cross-platform system lifecycle monitoring for Rust — shutdown blocking, sleep
 |---------|---------|-------|
 | Shutdown blocking | ✓ `WM_QUERYENDSESSION` + `ShutdownBlockReasonCreate` | ✓ `NSTerminateLater` |
 | Sleep / wake | ✓ `WM_POWERBROADCAST` | ✓ `NSWorkspace` notifications |
-| Network up / down | ✓ `NotifyIpInterfaceChange` | ✓ `NWPathMonitor` |
+| Network up / down | ✓ `NotifyNetworkConnectivityHintChange` ¹ | ✓ `NWPathMonitor` |
 | Async cleanup | ✓ handle-based, tokio-compatible | ✓ |
+
+> ¹ **Windows minimum requirement:** Windows 10, version 2004 (build 19041) — required by the `NotifyNetworkConnectivityHintChange` API.
 
 ## Quick start
 

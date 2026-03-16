@@ -8,8 +8,10 @@
 |------|---------|-------|
 | 关机阻断 | ✓ `WM_QUERYENDSESSION` + `ShutdownBlockReasonCreate` | ✓ `NSTerminateLater` |
 | 睡眠 / 唤醒 | ✓ `WM_POWERBROADCAST` | ✓ `NSWorkspace` 通知 |
-| 网络上下线 | ✓ `NotifyIpInterfaceChange` | ✓ `NWPathMonitor` |
+| 网络上下线 | ✓ `NotifyNetworkConnectivityHintChange` ¹ | ✓ `NWPathMonitor` |
 | 异步清理 | ✓ handle-based，兼容 tokio | ✓ |
+
+> ¹ **Windows 最低版本要求：** Windows 10，版本 2004（内部版本 19041）——`NotifyNetworkConnectivityHintChange` API 所需。
 
 ## 快速开始
 
