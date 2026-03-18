@@ -1,243 +1,224 @@
-/// A handle returned inside [`SystemEvent::ShuttingDown`].
-///
-/// The holder of this handle controls whether shutdown proceeds.
-/// Call [`ShutdownHandle::block`] to delay shutdown (optionally with a reason),
-/// then [`ShutdownHandle::allow`] once async cleanup has finished.
-///
-/// Dropping the handle without calling either method defaults to *allowing* shutdown.
-#[cfg(feature = "shutdown")]
-pub struct ShutdownHandle {
-    /// Wrapped in `Option` so that `Drop` can take ownership without `unsafe`.
-    pub(crate) inner: Option<ShutdownHandleInner>,
-}
+//! Shared event types and channel helpers used by all platform backends.
+//! 所有平台后端共用的事件类型与通道工具。
+
+// ─── Feature submodules ────────────────────────────────────────────────────────
 
 #[cfg(feature = "shutdown")]
-pub(crate) enum ShutdownHandleInner {
-    /// Resolved at construction time (e.g. macOS `replyToApplicationShouldTerminate:`).
-    Mpsc(std::sync::mpsc::SyncSender<ShutdownDecision>),
-    // Tokio variant kept behind feature flag so the crate is usable without tokio.
-    #[cfg(feature = "tokio")]
-    Tokio(tokio::sync::oneshot::Sender<ShutdownDecision>),
-}
+pub(crate) mod shutdown;
+
+#[cfg(feature = "sleep")]
+pub(crate) mod sleep;
+
+// ─── Public re-exports from feature submodules ─────────────────────────────────
 
 #[cfg(feature = "shutdown")]
-#[derive(Debug)]
-#[allow(dead_code)] // `reason` is read by the Windows backend
-pub(crate) enum ShutdownDecision {
-    Allow,
-    Block { reason: Option<String> },
-}
-
-#[cfg(feature = "shutdown")]
-impl ShutdownHandle {
-    /// Tell the OS: "I'm not ready yet — please wait."
-    ///
-    /// `reason` is displayed to the user on Windows (max ~512 chars).
-    /// On macOS the string is ignored (the system controls the UI).
-    pub fn block(mut self, reason: impl Into<String>) {
-        let reason = Some(reason.into());
-        self.send_inner(ShutdownDecision::Block { reason });
-    }
-
-    /// Tell the OS: "I'm done — go ahead and shut down."
-    pub fn allow(mut self) {
-        self.send_inner(ShutdownDecision::Allow);
-    }
-
-    fn send_inner(&mut self, decision: ShutdownDecision) {
-        if let Some(inner) = self.inner.take() {
-            match inner {
-                ShutdownHandleInner::Mpsc(tx) => {
-                    let _ = tx.send(decision);
-                }
-                #[cfg(feature = "tokio")]
-                ShutdownHandleInner::Tokio(tx) => {
-                    let _ = tx.send(decision);
-                }
-            }
-        }
-    }
-}
-
-#[cfg(feature = "shutdown")]
-impl Drop for ShutdownHandle {
-    /// If the caller drops the handle without deciding, default to `Allow`.
-    fn drop(&mut self) {
-        self.send_inner(ShutdownDecision::Allow);
-    }
-}
-
-// ─── Sleep handle & level (deep mode) ────────────────────────────────────────
-
-/// A handle returned inside [`SystemEvent::WillHibernate`].
-///
-/// Call [`SleepHandle::allow`] when your pre-sleep work is done; the OS will
-/// then be allowed to proceed with deep sleep / hibernation.
-///
-/// Dropping the handle without calling `allow` also unblocks the OS.
-#[cfg(feature = "sleep")]
-pub struct SleepHandle {
-    pub(crate) inner: Option<std::sync::mpsc::SyncSender<()>>,
-}
+pub use shutdown::ShutdownHandle;
 
 #[cfg(feature = "sleep")]
-impl SleepHandle {
-    /// Signal that pre-sleep work is complete; the OS may now hibernate.
-    pub fn allow(mut self) {
-        if let Some(tx) = self.inner.take() {
-            let _ = tx.send(());
-        }
-    }
-}
+pub use sleep::{SleepHandle, SleepMonitorLevel};
 
-#[cfg(feature = "sleep")]
-impl Drop for SleepHandle {
-    /// Dropping without calling `allow` still unblocks the OS.
-    fn drop(&mut self) {
-        if let Some(tx) = self.inner.take() {
-            let _ = tx.send(());
-        }
-    }
-}
-
-/// Controls the depth of sleep monitoring on macOS.
-///
-/// Has no effect on other platforms.
-#[cfg(feature = "sleep")]
-#[derive(Clone, Debug)]
-pub enum SleepMonitorLevel {
-    /// **Default.** Uses `NSWorkspaceWillSleepNotification` /
-    /// `NSWorkspaceDidWakeNotification`.  No extra thread; no delay capability.
-    Standard,
-
-    /// Uses IOKit `IORegisterForSystemPower` on a dedicated CFRunLoop thread.
-    ///
-    /// - Emits [`SystemEvent::WillHibernate`] (with a [`SleepHandle`]) before
-    ///   any sleep, including hibernation.
-    /// - Does **not** emit [`SystemEvent::WillSleep`].
-    /// - Still emits [`SystemEvent::DidWake`] after wake.
-    /// - The OS waits at most `timeout` for [`SleepHandle::allow`] before
-    ///   proceeding anyway.
-    Deep {
-        /// How long to wait for [`SleepHandle::allow`] before unblocking the OS.
-        timeout: std::time::Duration,
-    },
-}
-
-#[cfg(feature = "sleep")]
-impl Default for SleepMonitorLevel {
-    fn default() -> Self { SleepMonitorLevel::Standard }
-}
-
-#[cfg(feature = "sleep")]
-impl SleepMonitorLevel {
-    /// Returns [`Deep`](SleepMonitorLevel::Deep) with the default 3 s timeout.
-    pub fn deep() -> Self {
-        SleepMonitorLevel::Deep { timeout: std::time::Duration::from_secs(3) }
-    }
-}
-
-// ─── Events ──────────────────────────────────────────────────────────────────
+// ─── SystemEvent ───────────────────────────────────────────────────────────────
 
 /// Events emitted by the sentinel to application code.
+///
+/// The available variants depend on which features are enabled.
+///
+/// ---
+///
+/// 哨兵向应用代码发出的事件，可用变体取决于启用的 feature。
 #[non_exhaustive]
 pub enum SystemEvent {
-    /// The system is about to suspend. Return quickly; you have very little time.
+    /// The system is about to suspend. Return quickly — very little time available.
+    ///
+    /// **macOS**: `NSWorkspaceWillSleepNotification` (Standard mode only).
+    /// **Windows**: `WM_POWERBROADCAST` / `PBT_APMSUSPEND`.
+    ///
+    /// ---
+    ///
+    /// 系统即将挂起，需快速返回。
+    ///
+    /// **macOS**：`NSWorkspaceWillSleepNotification`（仅 Standard 模式）。
+    /// **Windows**：`WM_POWERBROADCAST` / `PBT_APMSUSPEND`。
     #[cfg(feature = "sleep")]
     WillSleep,
+
     /// The system has resumed from suspend.
+    ///
+    /// **macOS**: `NSWorkspaceDidWakeNotification` (Standard) or
+    /// `kIOMessageSystemHasPoweredOn` (Deep).
+    /// **Windows**: `WM_POWERBROADCAST` / `PBT_APMRESUMESUSPEND`.
+    ///
+    /// ---
+    ///
+    /// 系统已从挂起中恢复。
+    ///
+    /// **macOS**：`NSWorkspaceDidWakeNotification`（Standard）或
+    /// `kIOMessageSystemHasPoweredOn`（Deep）。
+    /// **Windows**：`WM_POWERBROADCAST` / `PBT_APMRESUMESUSPEND`。
     #[cfg(feature = "sleep")]
     DidWake,
-    /// A network interface has come up (at least one route is reachable).
+
+    /// At least one network interface is reachable.
+    ///
+    /// **macOS**: `NWPathMonitor` path status `satisfied` (Network.framework, 10.14+).
+    /// **Windows**: `NotifyNetworkConnectivityHintChange` / `InternetAccess` or
+    /// `ConstrainedInternetAccess`.
+    ///
+    /// ---
+    ///
+    /// 至少一个网络接口可达。
+    ///
+    /// **macOS**：`NWPathMonitor` 路径状态 `satisfied`（Network.framework，10.14+）。
+    /// **Windows**：`NotifyNetworkConnectivityHintChange` / `InternetAccess` 或
+    /// `ConstrainedInternetAccess`。
     #[cfg(feature = "network")]
     NetworkUp,
-    /// All network interfaces are gone / unreachable.
+
+    /// All network interfaces are gone or unreachable.
+    ///
+    /// ---
+    ///
+    /// 所有网络接口均不可达。
     #[cfg(feature = "network")]
     NetworkDown,
-    /// The user (or system policy) has requested shutdown/logout/restart.
-    ///
-    /// Use [`ShutdownHandle::block`] to delay it while you do async cleanup,
-    /// then [`ShutdownHandle::allow`] when ready.
-    #[cfg(feature = "shutdown")]
-    ShuttingDown(ShutdownHandle),
 
-    /// The system is about to sleep (including deep sleep / hibernation).
+    /// The user or system policy has requested shutdown, logout, or restart.
     ///
-    /// Call [`SleepHandle::allow`] once your pre-sleep work is done; the OS
-    /// will then proceed.  If the handle is dropped or the configured timeout
-    /// expires, the OS is unblocked automatically.
+    /// Use [`ShutdownHandle::block`] to delay it while doing async cleanup,
+    /// then [`ShutdownHandle::allow`] when ready.
     ///
-    /// **Only emitted in [`SleepMonitorLevel::Deep`] mode on macOS.**
+    /// **macOS**: `applicationShouldTerminate:` returning `NSTerminateLater`.
+    /// **Windows**: `WM_QUERYENDSESSION` + `ShutdownBlockReasonCreate`.
+    ///
+    /// ---
+    ///
+    /// 用户或系统策略请求关机、注销或重启。
+    ///
+    /// 调用 [`ShutdownHandle::block`] 延迟，清理完成后调用 [`ShutdownHandle::allow`]。
+    ///
+    /// **macOS**：`applicationShouldTerminate:` 返回 `NSTerminateLater`。
+    /// **Windows**：`WM_QUERYENDSESSION` + `ShutdownBlockReasonCreate`。
+    #[cfg(feature = "shutdown")]
+    ShuttingDown(shutdown::ShutdownHandle),
+
+    /// The system is about to enter deep sleep or hibernation.
+    ///
+    /// Call [`SleepHandle::allow`] once pre-sleep work is done. If the handle is
+    /// dropped or the configured `timeout` expires, the OS is unblocked automatically.
+    ///
+    /// **Only emitted on macOS in [`SleepMonitorLevel::Deep`] mode**
+    /// (`kIOMessageSystemWillSleep` via `IORegisterForSystemPower`).
+    ///
+    /// ---
+    ///
+    /// 系统即将深度睡眠或休眠。
+    ///
+    /// 完成睡前工作后调用 [`SleepHandle::allow`]；丢弃句柄或超时后 OS 自动解除阻塞。
+    ///
+    /// **仅在 macOS [`SleepMonitorLevel::Deep`] 模式下发出**
+    /// （通过 `IORegisterForSystemPower` 的 `kIOMessageSystemWillSleep`）。
     #[cfg(feature = "sleep")]
-    WillHibernate(SleepHandle),
+    WillHibernate(sleep::SleepHandle),
 }
 
 impl std::fmt::Debug for SystemEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             #[cfg(feature = "sleep")]
-            SystemEvent::WillSleep => write!(f, "WillSleep"),
+            SystemEvent::WillSleep       => write!(f, "WillSleep"),
             #[cfg(feature = "sleep")]
-            SystemEvent::DidWake => write!(f, "DidWake"),
+            SystemEvent::DidWake         => write!(f, "DidWake"),
             #[cfg(feature = "network")]
-            SystemEvent::NetworkUp => write!(f, "NetworkUp"),
+            SystemEvent::NetworkUp       => write!(f, "NetworkUp"),
             #[cfg(feature = "network")]
-            SystemEvent::NetworkDown => write!(f, "NetworkDown"),
+            SystemEvent::NetworkDown     => write!(f, "NetworkDown"),
             #[cfg(feature = "shutdown")]
             SystemEvent::ShuttingDown(_) => write!(f, "ShuttingDown(<handle>)"),
             #[cfg(feature = "sleep")]
             SystemEvent::WillHibernate(_) => write!(f, "WillHibernate(<handle>)"),
-            // When some features are disabled, the enum may have no visible variants.
-            // The wildcard arm keeps the match exhaustive in all configurations.
             #[allow(unreachable_patterns)]
             _ => write!(f, "SystemEvent(<unknown>)"),
         }
     }
 }
 
-// ─── Channel helpers ─────────────────────────────────────────────────────────
+// ─── Channel helpers ───────────────────────────────────────────────────────────
 
-/// Create an unbounded event channel.
+/// Create an unbounded synchronous event channel.
 ///
-/// The sender never blocks, which is critical for platform backends that call
-/// `send` from inside a Win32 window procedure or an OS callback.
+/// The sender never blocks, which is required for platform backends that call
+/// `send` from a Win32 window procedure or an OS power callback.
+///
+/// ---
+///
+/// 创建无界同步事件通道。
+///
+/// 发送端永不阻塞，这是从 Win32 窗口过程或 OS 电源回调中发送事件的前提。
 pub fn channel() -> (EventSender, EventReceiver) {
     let (tx, rx) = std::sync::mpsc::channel();
     (EventSender { tx }, EventReceiver { rx })
 }
 
+/// Sending half of the event channel. Cheap to clone via [`Arc`] at the call site.
+///
+/// ---
+///
+/// 事件通道的发送端。调用端可通过 [`Arc`] 廉价共享。
 pub struct EventSender {
     pub(crate) tx: std::sync::mpsc::Sender<SystemEvent>,
 }
 
+/// Receiving half of the event channel. `Send`, so it can move to any thread.
+///
+/// ---
+///
+/// 事件通道的接收端，实现了 `Send`，可移至任意线程。
 pub struct EventReceiver {
     rx: std::sync::mpsc::Receiver<SystemEvent>,
 }
 
 impl EventSender {
     pub(crate) fn send(&self, ev: SystemEvent) {
-        // Ignore send errors — the receiver may have been dropped intentionally.
         let _ = self.tx.send(ev);
     }
 }
 
 impl EventReceiver {
-    /// Block until the next event arrives.
+    /// Block until the next event arrives. Returns `None` if the sender is dropped.
+    ///
+    /// ---
+    ///
+    /// 阻塞直到下一个事件到来；发送端丢弃时返回 `None`。
     pub fn recv(&self) -> Option<SystemEvent> {
         self.rx.recv().ok()
     }
 
-    /// Non-blocking poll.
+    /// Non-blocking poll. Returns `None` if no event is ready.
+    ///
+    /// ---
+    ///
+    /// 非阻塞轮询；无事件时返回 `None`。
     pub fn try_recv(&self) -> Option<SystemEvent> {
         self.rx.try_recv().ok()
     }
 }
 
+// ─── Tokio async channel ───────────────────────────────────────────────────────
+
+/// Async-compatible channel backed by `tokio::sync::mpsc`.
+///
+/// ---
+///
+/// 基于 `tokio::sync::mpsc` 的异步兼容通道。
 #[cfg(feature = "tokio")]
 pub mod tokio_support {
     use super::SystemEvent;
 
-    /// Async-compatible event channel backed by `tokio::sync::mpsc`.
+    /// Create an async event channel with the given buffer capacity.
+    ///
+    /// ---
+    ///
+    /// 创建指定缓冲容量的异步事件通道。
     pub fn channel(cap: usize) -> (AsyncEventSender, AsyncEventReceiver) {
         let (tx, rx) = tokio::sync::mpsc::channel(cap);
         (AsyncEventSender { tx }, AsyncEventReceiver { rx })
@@ -253,21 +234,15 @@ pub mod tokio_support {
 
     impl AsyncEventSender {
         pub(crate) fn send(&self, ev: SystemEvent) {
-            // `tokio::spawn` panics when called outside a Tokio runtime (e.g. from
-            // the Win32 message-loop thread).  Use `try_current` so we only spawn
-            // a task when a runtime is actually present; otherwise fall back to
-            // `try_send` (lifecycle events are rare enough that backpressure drop
-            // is acceptable as a last resort).
+            // `tokio::spawn` panics outside a runtime. Use `try_current` to
+            // detect the runtime; fall back to `try_send` when absent.
+            //
+            // `tokio::spawn` 在运行时外会 panic。用 `try_current` 检测运行时；
+            // 不存在时回退到 `try_send`（生命周期事件频率低，偶发丢弃可接受）。
             let tx = self.tx.clone();
             match tokio::runtime::Handle::try_current() {
-                Ok(handle) => {
-                    handle.spawn(async move {
-                        let _ = tx.send(ev).await;
-                    });
-                }
-                Err(_) => {
-                    let _ = self.tx.try_send(ev);
-                }
+                Ok(handle) => { handle.spawn(async move { let _ = tx.send(ev).await; }); }
+                Err(_)     => { let _ = self.tx.try_send(ev); }
             }
         }
     }
