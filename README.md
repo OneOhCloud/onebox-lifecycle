@@ -7,7 +7,7 @@ Cross-platform system lifecycle monitoring for Rust — shutdown blocking, sleep
 | Feature | Windows | macOS |
 |---------|---------|-------|
 | Shutdown blocking | ✓ `WM_QUERYENDSESSION` + `ShutdownBlockReasonCreate` | ✓ `NSTerminateLater` |
-| Sleep / wake | ✓ `WM_POWERBROADCAST` | ✓ `NSWorkspace` notifications |
+| Sleep / wake | ✓ `WM_POWERBROADCAST` | ✓ `NSWorkspace` (Standard) · `IORegisterForSystemPower` (Deep) |
 | Network up / down | ✓ `NotifyNetworkConnectivityHintChange` ¹ | ✓ `NWPathMonitor` |
 | Async cleanup | ✓ handle-based, tokio-compatible | ✓ |
 
@@ -57,6 +57,54 @@ async fn main() {
     }
 }
 ```
+
+## Deep sleep monitoring (macOS)
+
+By default (`SleepMonitorLevel::Standard`) the library uses `NSWorkspace`
+notifications — lightweight, no extra thread, but purely informational (no
+delay capability).
+
+`SleepMonitorLevel::Deep` switches to IOKit's `IORegisterForSystemPower` on a
+dedicated CFRunLoop thread.  Before every sleep transition (including
+hibernation) it delivers `SystemEvent::WillHibernate(handle)` with a
+[`SleepHandle`].  The OS waits until you call `handle.allow()` or until the
+configured timeout expires, then proceeds.
+
+```rust
+use onebox_lifecycle::{Sentinel, SentinelConfig, SleepMonitorLevel, SystemEvent};
+use std::time::Duration;
+
+fn main() {
+    let sentinel = Sentinel::start_with_config(SentinelConfig {
+        sleep_monitor_level: SleepMonitorLevel::Deep {
+            timeout: Duration::from_secs(5), // default: 3 s
+        },
+        ..Default::default()
+    });
+
+    while let Some(event) = sentinel.recv() {
+        match event {
+            SystemEvent::WillHibernate(handle) => {
+                // Flush buffers, close connections, etc.
+                println!("Hibernate incoming — saving state…");
+                handle.allow(); // unblock the OS
+            }
+            SystemEvent::DidWake => println!("System woke up"),
+            _ => {}
+        }
+    }
+}
+```
+
+> **`WillSleep` vs `WillHibernate`**
+>
+> | Mode | Event fired | Delay capability |
+> |------|-------------|-----------------|
+> | `Standard` (default) | `WillSleep` | No |
+> | `Deep` | `WillHibernate(handle)` | Yes — up to `timeout` |
+>
+> Deep mode does **not** emit `WillSleep`.  Existing code that only matches
+> `WillSleep` continues to work unchanged in Standard mode.
 
 ## Tauri integration
 
@@ -197,9 +245,9 @@ agent (`make install-agent`) avoids this.
 
 ```
 src/
-├── lib.rs           Public API: Sentinel, SystemEvent
-├── common/mod.rs    Shared types: ShutdownHandle, EventReceiver/Sender
-├── macos/mod.rs     macOS backend: NSApplicationDelegate, NSWorkspace, NWPathMonitor
+├── lib.rs           Public API: Sentinel, SentinelConfig, SystemEvent
+├── common/mod.rs    Shared types: ShutdownHandle, SleepHandle, SleepMonitorLevel, EventReceiver/Sender
+├── macos/mod.rs     macOS backend: NSApplicationDelegate, NSWorkspace / IOKit, NWPathMonitor
 └── windows/mod.rs   Windows backend: hidden Win32 message-loop window
 
 examples/

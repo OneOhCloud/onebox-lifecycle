@@ -7,7 +7,7 @@
 | 功能 | Windows | macOS |
 |------|---------|-------|
 | 关机阻断 | ✓ `WM_QUERYENDSESSION` + `ShutdownBlockReasonCreate` | ✓ `NSTerminateLater` |
-| 睡眠 / 唤醒 | ✓ `WM_POWERBROADCAST` | ✓ `NSWorkspace` 通知 |
+| 睡眠 / 唤醒 | ✓ `WM_POWERBROADCAST` | ✓ `NSWorkspace`（标准）· `IORegisterForSystemPower`（深度） |
 | 网络上下线 | ✓ `NotifyNetworkConnectivityHintChange` ¹ | ✓ `NWPathMonitor` |
 | 异步清理 | ✓ handle-based，兼容 tokio | ✓ |
 
@@ -57,6 +57,47 @@ async fn main() {
     }
 }
 ```
+
+## 深度睡眠监控（macOS）
+
+默认模式（`SleepMonitorLevel::Standard`）使用 `NSWorkspace` 通知——轻量、无额外线程，但仅能被动接收，无法延迟睡眠。
+
+`SleepMonitorLevel::Deep` 切换至 IOKit `IORegisterForSystemPower`，在独立的 CFRunLoop 线程上运行。在每次睡眠（包括深度休眠/Hibernation）前，会投递 `SystemEvent::WillHibernate(handle)` 携带一个 [`SleepHandle`]。系统将等待 `handle.allow()` 被调用或超时后才继续睡眠。
+
+```rust
+use onebox_lifecycle::{Sentinel, SentinelConfig, SleepMonitorLevel, SystemEvent};
+use std::time::Duration;
+
+fn main() {
+    let sentinel = Sentinel::start_with_config(SentinelConfig {
+        sleep_monitor_level: SleepMonitorLevel::Deep {
+            timeout: Duration::from_secs(5), // 默认 3 秒
+        },
+        ..Default::default()
+    });
+
+    while let Some(event) = sentinel.recv() {
+        match event {
+            SystemEvent::WillHibernate(handle) => {
+                // 刷写缓冲、关闭连接等…
+                println!("即将休眠，正在保存状态…");
+                handle.allow(); // 通知系统可以继续
+            }
+            SystemEvent::DidWake => println!("系统已唤醒"),
+            _ => {}
+        }
+    }
+}
+```
+
+> **`WillSleep` 与 `WillHibernate` 的区别**
+>
+> | 模式 | 投递的事件 | 可延迟睡眠 |
+> |------|-----------|-----------|
+> | `Standard`（默认） | `WillSleep` | 否 |
+> | `Deep` | `WillHibernate(handle)` | 是，最长 `timeout` |
+>
+> Deep 模式**不会**投递 `WillSleep`。只处理 `WillSleep` 的现有代码在 Standard 模式下无需任何改动。
 
 ## 与 Tauri 集成
 
@@ -192,9 +233,9 @@ macOS 关机时先询问 Terminal 是否退出。若 Terminal 杀死子进程，
 
 ```
 src/
-├── lib.rs           公共 API：Sentinel、SystemEvent
-├── common/mod.rs    共享类型：ShutdownHandle、EventReceiver/Sender
-├── macos/mod.rs     macOS 后端：NSApplicationDelegate、NSWorkspace、NWPathMonitor
+├── lib.rs           公共 API：Sentinel、SentinelConfig、SystemEvent
+├── common/mod.rs    共享类型：ShutdownHandle、SleepHandle、SleepMonitorLevel、EventReceiver/Sender
+├── macos/mod.rs     macOS 后端：NSApplicationDelegate、NSWorkspace / IOKit、NWPathMonitor
 └── windows/mod.rs   Windows 后端：隐藏 Win32 窗口消息循环
 
 examples/

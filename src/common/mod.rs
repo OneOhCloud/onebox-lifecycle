@@ -67,6 +67,76 @@ impl Drop for ShutdownHandle {
     }
 }
 
+// ─── Sleep handle & level (deep mode) ────────────────────────────────────────
+
+/// A handle returned inside [`SystemEvent::WillHibernate`].
+///
+/// Call [`SleepHandle::allow`] when your pre-sleep work is done; the OS will
+/// then be allowed to proceed with deep sleep / hibernation.
+///
+/// Dropping the handle without calling `allow` also unblocks the OS.
+#[cfg(feature = "sleep")]
+pub struct SleepHandle {
+    pub(crate) inner: Option<std::sync::mpsc::SyncSender<()>>,
+}
+
+#[cfg(feature = "sleep")]
+impl SleepHandle {
+    /// Signal that pre-sleep work is complete; the OS may now hibernate.
+    pub fn allow(mut self) {
+        if let Some(tx) = self.inner.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+#[cfg(feature = "sleep")]
+impl Drop for SleepHandle {
+    /// Dropping without calling `allow` still unblocks the OS.
+    fn drop(&mut self) {
+        if let Some(tx) = self.inner.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Controls the depth of sleep monitoring on macOS.
+///
+/// Has no effect on other platforms.
+#[cfg(feature = "sleep")]
+#[derive(Clone, Debug)]
+pub enum SleepMonitorLevel {
+    /// **Default.** Uses `NSWorkspaceWillSleepNotification` /
+    /// `NSWorkspaceDidWakeNotification`.  No extra thread; no delay capability.
+    Standard,
+
+    /// Uses IOKit `IORegisterForSystemPower` on a dedicated CFRunLoop thread.
+    ///
+    /// - Emits [`SystemEvent::WillHibernate`] (with a [`SleepHandle`]) before
+    ///   any sleep, including hibernation.
+    /// - Does **not** emit [`SystemEvent::WillSleep`].
+    /// - Still emits [`SystemEvent::DidWake`] after wake.
+    /// - The OS waits at most `timeout` for [`SleepHandle::allow`] before
+    ///   proceeding anyway.
+    Deep {
+        /// How long to wait for [`SleepHandle::allow`] before unblocking the OS.
+        timeout: std::time::Duration,
+    },
+}
+
+#[cfg(feature = "sleep")]
+impl Default for SleepMonitorLevel {
+    fn default() -> Self { SleepMonitorLevel::Standard }
+}
+
+#[cfg(feature = "sleep")]
+impl SleepMonitorLevel {
+    /// Returns [`Deep`](SleepMonitorLevel::Deep) with the default 3 s timeout.
+    pub fn deep() -> Self {
+        SleepMonitorLevel::Deep { timeout: std::time::Duration::from_secs(3) }
+    }
+}
+
 // ─── Events ──────────────────────────────────────────────────────────────────
 
 /// Events emitted by the sentinel to application code.
@@ -90,6 +160,16 @@ pub enum SystemEvent {
     /// then [`ShutdownHandle::allow`] when ready.
     #[cfg(feature = "shutdown")]
     ShuttingDown(ShutdownHandle),
+
+    /// The system is about to sleep (including deep sleep / hibernation).
+    ///
+    /// Call [`SleepHandle::allow`] once your pre-sleep work is done; the OS
+    /// will then proceed.  If the handle is dropped or the configured timeout
+    /// expires, the OS is unblocked automatically.
+    ///
+    /// **Only emitted in [`SleepMonitorLevel::Deep`] mode on macOS.**
+    #[cfg(feature = "sleep")]
+    WillHibernate(SleepHandle),
 }
 
 impl std::fmt::Debug for SystemEvent {
@@ -105,6 +185,8 @@ impl std::fmt::Debug for SystemEvent {
             SystemEvent::NetworkDown => write!(f, "NetworkDown"),
             #[cfg(feature = "shutdown")]
             SystemEvent::ShuttingDown(_) => write!(f, "ShuttingDown(<handle>)"),
+            #[cfg(feature = "sleep")]
+            SystemEvent::WillHibernate(_) => write!(f, "WillHibernate(<handle>)"),
             // When some features are disabled, the enum may have no visible variants.
             // The wildcard arm keeps the match exhaustive in all configurations.
             #[allow(unreachable_patterns)]

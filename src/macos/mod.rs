@@ -52,6 +52,10 @@ use crate::common::EventSender;
 use crate::common::SystemEvent;
 #[cfg(feature = "shutdown")]
 use crate::common::{ShutdownDecision, ShutdownHandle, ShutdownHandleInner};
+#[cfg(feature = "sleep")]
+use crate::common::{SleepHandle, SleepMonitorLevel};
+#[cfg(feature = "sleep")]
+use std::sync::atomic::{AtomicU32, Ordering};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -413,25 +417,318 @@ fn start_nw_path_monitor(event_tx: Arc<EventSender>) -> PathMonitorGuard {
     }
 }
 
+// ─── IOKit FFI (deep sleep) ───────────────────────────────────────────────────
+//
+// IOKit's power notification API allows delaying system sleep until the caller
+// explicitly calls `IOAllowPowerChange`.  Notifications fire on a dedicated
+// CFRunLoop thread, which blocks (recv_timeout) until the SleepHandle is
+// resolved or the caller-configured timeout expires.
+
+#[cfg(feature = "sleep")]
+#[allow(non_camel_case_types, non_upper_case_globals)]
+mod iokit_ffi {
+    use std::ffi::c_void;
+
+    /// `mach_port_t` — the type underlying both `io_object_t` and `io_connect_t`.
+    pub type io_object_t  = u32;
+    pub type io_connect_t = io_object_t;
+    /// Opaque Mach-port wrapper returned by `IORegisterForSystemPower`.
+    pub type IONotificationPortRef = *mut c_void;
+
+    /// System is going to sleep — acknowledge with `IOAllowPowerChange`.
+    pub const kIOMessageSystemWillSleep:    u32 = 0xe000_0280;
+    /// System has fully powered on after wake.
+    pub const kIOMessageSystemHasPoweredOn: u32 = 0xe000_0300;
+
+    /// `IOServiceInterestCallback`:
+    ///   `void (*)(void *refcon, io_service_t, uint32_t messageType, void *messageArgument)`
+    pub type IOServiceInterestCallback = unsafe extern "C" fn(
+        refcon:           *mut c_void,
+        service:          io_object_t,
+        message_type:     u32,
+        message_argument: *mut c_void,
+    );
+
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        /// Register for sleep/wake messages on the root power domain.
+        /// Returns the `io_connect_t` needed for `IOAllowPowerChange`.
+        pub fn IORegisterForSystemPower(
+            refcon:            *mut c_void,
+            notification_port: *mut IONotificationPortRef,
+            callback:          IOServiceInterestCallback,
+            notifier:          *mut io_object_t,
+        ) -> io_connect_t;
+
+        /// Extract the `CFRunLoopSourceRef` from the notification port.
+        pub fn IONotificationPortGetRunLoopSource(
+            notify: IONotificationPortRef,
+        ) -> *mut c_void; // CFRunLoopSourceRef
+
+        /// Allow the power transition to proceed.  Thread-safe per Apple docs.
+        pub fn IOAllowPowerChange(
+            kernel_port:     io_connect_t,
+            notification_id: *mut c_void, // messageArgument
+        ) -> i32;
+
+        /// Unregister the notifier from the power domain.
+        pub fn IODeregisterForSystemPower(notifier: *mut io_object_t) -> i32;
+
+        /// Decrement the IOKit retain count on an object.
+        pub fn IOObjectRelease(object: io_object_t) -> i32;
+
+        /// Destroy the notification port (releases Mach port resources).
+        pub fn IONotificationPortDestroy(notify: IONotificationPortRef);
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        /// Returns the `CFRunLoopRef` for the current thread.
+        pub fn CFRunLoopGetCurrent() -> *mut c_void;
+
+        /// Adds a source to a run loop in the given mode.
+        pub fn CFRunLoopAddSource(
+            rl:     *mut c_void,  // CFRunLoopRef
+            source: *mut c_void,  // CFRunLoopSourceRef
+            mode:   *const c_void, // CFStringRef
+        );
+
+        /// Run the current thread's run loop until `CFRunLoopStop` is called.
+        pub fn CFRunLoopRun();
+
+        /// Stop a run loop.  Thread-safe per Apple docs.
+        pub fn CFRunLoopStop(rl: *mut c_void);
+
+        /// Increment the CF retain count.
+        pub fn CFRetain(cf: *const c_void) -> *const c_void;
+
+        /// Decrement the CF retain count; may deallocate.
+        pub fn CFRelease(cf: *const c_void);
+
+        /// Default run-loop mode (`"kCFRunLoopDefaultMode"`).
+        pub static kCFRunLoopDefaultMode: *const c_void;
+    }
+}
+
+// ─── IOKit callback context ───────────────────────────────────────────────────
+
+/// Shared state passed to the C callback via `refcon`.
+/// Heap-allocated behind an `Arc`; the background thread borrows it as `&Self`.
+#[cfg(feature = "sleep")]
+struct IoKitCallbackContext {
+    event_tx:    Arc<EventSender>,
+    /// Set by the background thread right after `IORegisterForSystemPower`
+    /// returns, before `CFRunLoopRun()` starts.  Read in the callback.
+    kernel_port: AtomicU32,
+    timeout:     std::time::Duration,
+}
+
+// ─── IOKit power callback ─────────────────────────────────────────────────────
+
+/// C callback fired on the dedicated IOKit CFRunLoop thread.
+///
+/// For `kIOMessageSystemWillSleep` we send a [`SystemEvent::WillHibernate`]
+/// and then block (up to `timeout`) for the caller to call
+/// [`SleepHandle::allow`].  `IOAllowPowerChange` is always called afterwards
+/// so the OS is never permanently blocked.
+#[cfg(feature = "sleep")]
+unsafe extern "C" fn iokit_power_callback(
+    refcon:           *mut std::ffi::c_void,
+    _service:         iokit_ffi::io_object_t,
+    message_type:     u32,
+    message_argument: *mut std::ffi::c_void,
+) {
+    // SAFETY: `refcon` points to an `Arc<IoKitCallbackContext>` that is kept
+    // alive by `IoKitDeepSleepGuard._ctx` for the entire CFRunLoop lifetime.
+    // We borrow it without adjusting the reference count.
+    let ctx = unsafe { &*(refcon as *const IoKitCallbackContext) };
+
+    match message_type {
+        iokit_ffi::kIOMessageSystemWillSleep => {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+            let handle = SleepHandle { inner: Some(tx) };
+            ctx.event_tx.send(SystemEvent::WillHibernate(handle));
+
+            // Block the CFRunLoop thread — IOKit waits for IOAllowPowerChange.
+            let _ = rx.recv_timeout(ctx.timeout);
+
+            let kernel_port = ctx.kernel_port.load(Ordering::Acquire);
+            unsafe { iokit_ffi::IOAllowPowerChange(kernel_port, message_argument); }
+        }
+        iokit_ffi::kIOMessageSystemHasPoweredOn => {
+            ctx.event_tx.send(SystemEvent::DidWake);
+        }
+        _ => {}
+    }
+}
+
+// ─── IoKitDeepSleepGuard ──────────────────────────────────────────────────────
+
+/// RAII guard — stops the CFRunLoop thread and releases IOKit resources on drop.
+#[cfg(feature = "sleep")]
+struct IoKitDeepSleepGuard {
+    /// Retained `CFRunLoopRef` of the background thread.
+    run_loop:          *mut std::ffi::c_void,
+    notifier:          iokit_ffi::io_object_t,
+    notification_port: iokit_ffi::IONotificationPortRef,
+    /// Joined before IOKit resources are released, ensuring in-flight callbacks
+    /// complete before `_ctx` drops and the Arc refcount reaches zero.
+    _thread:           Option<std::thread::JoinHandle<()>>,
+    /// Keeps `IoKitCallbackContext` alive until the thread exits.
+    _ctx:              Arc<IoKitCallbackContext>,
+}
+
+#[cfg(feature = "sleep")]
+impl Drop for IoKitDeepSleepGuard {
+    fn drop(&mut self) {
+        unsafe {
+            // 1. Signal the run loop to exit (thread-safe).
+            iokit_ffi::CFRunLoopStop(self.run_loop);
+        }
+        // 2. Wait for the thread — ensures any in-progress callback finishes
+        //    before we release the IOKit objects it may be using.
+        if let Some(thread) = self._thread.take() {
+            let _ = thread.join();
+        }
+        unsafe {
+            // 3. Release the retained CFRunLoopRef.
+            iokit_ffi::CFRelease(self.run_loop as *const _);
+            // 4. Deregister from IOKit.
+            iokit_ffi::IODeregisterForSystemPower(&mut self.notifier);
+            iokit_ffi::IOObjectRelease(self.notifier);
+            // 5. Destroy the Mach notification port.
+            iokit_ffi::IONotificationPortDestroy(self.notification_port);
+        }
+    }
+}
+
+// SAFETY: All IOKit / CoreFoundation cleanup APIs used in `Drop` are
+// documented as thread-safe by Apple.  Raw pointers are only accessed in
+// `Drop`, which runs at most once.
+#[cfg(feature = "sleep")]
+unsafe impl Send for IoKitDeepSleepGuard {}
+#[cfg(feature = "sleep")]
+unsafe impl Sync for IoKitDeepSleepGuard {}
+
+// ─── IOKit deep-sleep constructor ─────────────────────────────────────────────
+
+/// Bundle of values the background thread sends back to the spawning thread
+/// after `IORegisterForSystemPower` succeeds.
+///
+/// Pointers are stored as `usize` so the struct is trivially `Send`
+/// (`usize: Send`), avoiding an `unsafe impl Send` for a raw-pointer struct.
+#[cfg(feature = "sleep")]
+struct IoKitInitResult {
+    /// `CFRunLoopRef` cast to `usize`.
+    run_loop:          usize,
+    notifier:          iokit_ffi::io_object_t,
+    /// `IONotificationPortRef` (`*mut c_void`) cast to `usize`.
+    notification_port: usize,
+}
+
+/// Start a dedicated CFRunLoop thread that registers for IOKit power
+/// notifications and emits [`SystemEvent::WillHibernate`] with a
+/// [`SleepHandle`] before each sleep transition.
+#[cfg(feature = "sleep")]
+fn start_iokit_deep_sleep(
+    event_tx: Arc<EventSender>,
+    timeout:  std::time::Duration,
+) -> IoKitDeepSleepGuard {
+    use iokit_ffi::*;
+
+    let ctx = Arc::new(IoKitCallbackContext {
+        event_tx,
+        kernel_port: AtomicU32::new(0),
+        timeout,
+    });
+    let ctx_for_guard = Arc::clone(&ctx);
+    // Store the raw pointer as `usize` so the closure capture is trivially
+    // `Send` (usize: Send).  The Arc is kept alive by `ctx_for_guard`.
+    let raw_ctx_usize = Arc::into_raw(ctx) as usize;
+
+    // Rendezvous channel: background thread sends init data before blocking.
+    let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<IoKitInitResult>(0);
+
+    let thread = std::thread::Builder::new()
+        .name("onebox_lifecycle_iokit".into())
+        .spawn(move || unsafe {
+            let raw = raw_ctx_usize as *mut std::ffi::c_void;
+
+            let mut notification_port: IONotificationPortRef = std::ptr::null_mut();
+            let mut notifier: io_object_t = 0;
+
+            let kernel_port = IORegisterForSystemPower(
+                raw,
+                &mut notification_port,
+                iokit_power_callback,
+                &mut notifier,
+            );
+            assert!(kernel_port != 0,
+                "onebox_lifecycle: IORegisterForSystemPower returned null");
+
+            // Write kernel_port before CFRunLoopRun() — callback fires only after.
+            let ctx_ref = &*(raw as *const IoKitCallbackContext);
+            ctx_ref.kernel_port.store(kernel_port, Ordering::Release);
+
+            // Retain and record this thread's run loop so Drop can stop it.
+            let rl = CFRunLoopGetCurrent();
+            CFRetain(rl as *const _);
+
+            let source = IONotificationPortGetRunLoopSource(notification_port);
+            CFRunLoopAddSource(rl, source, kCFRunLoopDefaultMode);
+
+            // Unblock the spawning thread.  Cast pointers to usize for Send.
+            let _ = init_tx.send(IoKitInitResult {
+                run_loop:          rl as usize,
+                notifier,
+                notification_port: notification_port as usize,
+            });
+
+            // Block until IoKitDeepSleepGuard::drop() calls CFRunLoopStop(rl).
+            CFRunLoopRun();
+
+            // Reclaim and drop the Arc — balances Arc::into_raw above.
+            drop(Arc::from_raw(raw as *const IoKitCallbackContext));
+        })
+        .expect("onebox_lifecycle: failed to spawn IOKit run-loop thread");
+
+    let init = init_rx.recv()
+        .expect("onebox_lifecycle: IOKit thread failed to initialise");
+
+    IoKitDeepSleepGuard {
+        run_loop:          init.run_loop as *mut std::ffi::c_void,
+        notifier:          init.notifier,
+        notification_port: init.notification_port as iokit_ffi::IONotificationPortRef,
+        _thread:           Some(thread),
+        _ctx:              ctx_for_guard,
+    }
+}
+
 // ─── MacosGuard ───────────────────────────────────────────────────────────────
 
 pub struct MacosGuard {
     #[cfg(feature = "shutdown")]
     _delegate: Retained<SentinelDelegate>,
+    /// `Some` in Standard mode; `None` in Deep mode (IOKit handles wake events).
     #[cfg(feature = "sleep")]
-    _power_observer: Retained<PowerObserver>,
-    /// Removes `NSNotificationCenter` observers before `_power_observer` drops.
-    /// Field order guarantees this drops first (Rust drops fields top-to-bottom).
+    _power_observer: Option<Retained<PowerObserver>>,
+    /// `Some` in Standard mode.  Declared after `_power_observer` so that
+    /// `removeObserver:` is called while NSNotificationCenter still holds a
+    /// strong reference to the observer object.
     #[cfg(feature = "sleep")]
-    _notification_guard: NotificationObserverGuard,
+    _notification_guard: Option<NotificationObserverGuard>,
     /// Cancels NWPathMonitor on drop.
     #[cfg(feature = "network")]
     _path_monitor: PathMonitorGuard,
+    /// `Some` in Deep mode; `None` in Standard mode.
+    /// Declared last so it drops after the NSWorkspace observers above.
+    #[cfg(feature = "sleep")]
+    _iokit_deep_sleep: Option<IoKitDeepSleepGuard>,
 }
 
 impl MacosGuard {
     /// Install all listeners.  **Must be called from the main thread.**
-    pub fn new(event_tx: EventSender) -> Self {
+    pub fn new(event_tx: EventSender, config: crate::SentinelConfig) -> Self {
         // Network-only builds don't reference `mtm` directly, but we still
         // assert main-thread for safety (NWPathMonitor setup is documented to
         // be safe from any thread, but future features may not be).
@@ -466,35 +763,47 @@ impl MacosGuard {
             delegate
         };
 
-        // ── 2. NSWorkspace sleep / wake notifications ───────────────────
+        // ── 2. Sleep / wake monitoring ──────────────────────────────────
+        //
+        // Standard: NSWorkspace notifications (WillSleep / DidWake, no delay).
+        // Deep:     IOKit CFRunLoop thread (WillHibernate + SleepHandle, DidWake).
+        //           NSWorkspace observers are skipped to avoid duplicate DidWake.
         #[cfg(feature = "sleep")]
-        let (_power_observer, _notification_guard) = {
-            let power_observer = PowerObserver::new(mtm, Arc::clone(&event_tx));
-            let notification_guard = autoreleasepool(|_pool| unsafe {
-                let workspace: *mut AnyObject = msg_send![objc2::class!(NSWorkspace), sharedWorkspace];
-                let nc: *mut AnyObject = msg_send![workspace, notificationCenter];
+        let (_power_observer, _notification_guard, _iokit_deep_sleep) =
+            match config.sleep_monitor_level {
+                SleepMonitorLevel::Standard => {
+                    let power_observer = PowerObserver::new(mtm, Arc::clone(&event_tx));
+                    let notification_guard = autoreleasepool(|_pool| unsafe {
+                        let workspace: *mut AnyObject =
+                            msg_send![objc2::class!(NSWorkspace), sharedWorkspace];
+                        let nc: *mut AnyObject = msg_send![workspace, notificationCenter];
 
-                let will_sleep = NSString::from_str(WILL_SLEEP_NOTIFICATION);
-                let did_wake = NSString::from_str(DID_WAKE_NOTIFICATION);
-                let observer = Retained::as_ptr(&power_observer) as *const NSObject;
+                        let will_sleep = NSString::from_str(WILL_SLEEP_NOTIFICATION);
+                        let did_wake   = NSString::from_str(DID_WAKE_NOTIFICATION);
+                        let observer   = Retained::as_ptr(&power_observer) as *const NSObject;
 
-                let _: () = msg_send![nc,
-                    addObserver: observer,
-                    selector: objc2::sel!(handleWillSleep:),
-                    name: &*will_sleep,
-                    object: std::ptr::null::<AnyObject>()
-                ];
-                let _: () = msg_send![nc,
-                    addObserver: observer,
-                    selector: objc2::sel!(handleDidWake:),
-                    name: &*did_wake,
-                    object: std::ptr::null::<AnyObject>()
-                ];
+                        let _: () = msg_send![nc,
+                            addObserver: observer,
+                            selector: objc2::sel!(handleWillSleep:),
+                            name: &*will_sleep,
+                            object: std::ptr::null::<AnyObject>()
+                        ];
+                        let _: () = msg_send![nc,
+                            addObserver: observer,
+                            selector: objc2::sel!(handleDidWake:),
+                            name: &*did_wake,
+                            object: std::ptr::null::<AnyObject>()
+                        ];
 
-                NotificationObserverGuard { observer }
-            });
-            (power_observer, notification_guard)
-        };
+                        NotificationObserverGuard { observer }
+                    });
+                    (Some(power_observer), Some(notification_guard), None)
+                }
+                SleepMonitorLevel::Deep { timeout } => {
+                    let guard = start_iokit_deep_sleep(Arc::clone(&event_tx), timeout);
+                    (None, None, Some(guard))
+                }
+            };
 
         // ── 3. NWPathMonitor (Network.framework, macOS 10.14+) ──────────
         #[cfg(feature = "network")]
@@ -509,6 +818,8 @@ impl MacosGuard {
             _notification_guard,
             #[cfg(feature = "network")]
             _path_monitor,
+            #[cfg(feature = "sleep")]
+            _iokit_deep_sleep,
         }
     }
 }

@@ -65,6 +65,8 @@ pub(crate) mod common;
 pub use common::{EventReceiver, EventSender, SystemEvent};
 #[cfg(feature = "shutdown")]
 pub use common::ShutdownHandle;
+#[cfg(feature = "sleep")]
+pub use common::{SleepHandle, SleepMonitorLevel};
 
 #[cfg(all(
     target_os = "windows",
@@ -77,6 +79,33 @@ mod windows;
     any(feature = "shutdown", feature = "sleep", feature = "network")
 ))]
 mod macos;
+
+// ─── Configuration ────────────────────────────────────────────────────────────
+
+/// Configuration passed to [`Sentinel::start_with_config`].
+///
+/// All fields have sensible defaults; [`SentinelConfig::default()`] gives the
+/// same behaviour as the existing [`Sentinel::start`].
+pub struct SentinelConfig {
+    /// Controls sleep-monitoring depth on macOS (ignored on other platforms).
+    ///
+    /// - [`SleepMonitorLevel::Standard`] — NSWorkspace notifications, no extra
+    ///   thread, no delay capability. **Default.**
+    /// - [`SleepMonitorLevel::Deep`] — IOKit `IORegisterForSystemPower` on a
+    ///   dedicated CFRunLoop thread; fires [`SystemEvent::WillHibernate`] with
+    ///   a [`SleepHandle`] and waits up to `timeout` before allowing sleep.
+    #[cfg(feature = "sleep")]
+    pub sleep_monitor_level: SleepMonitorLevel,
+}
+
+impl Default for SentinelConfig {
+    fn default() -> Self {
+        SentinelConfig {
+            #[cfg(feature = "sleep")]
+            sleep_monitor_level: SleepMonitorLevel::Standard,
+        }
+    }
+}
 
 // ─── Platform-agnostic facade ─────────────────────────────────────────────────
 
@@ -92,13 +121,22 @@ pub struct Sentinel {
 }
 
 impl Sentinel {
-    /// Start the sentinel.
+    /// Start the sentinel with default configuration.
+    ///
+    /// Equivalent to `Sentinel::start_with_config(SentinelConfig::default())`.
+    pub fn start() -> Self {
+        Self::start_with_config(SentinelConfig::default())
+    }
+
+    /// Start the sentinel with explicit configuration.
     ///
     /// On **Windows**: spawns a background thread with a hidden Win32 window.
+    /// `config` is currently unused on Windows.
     ///
     /// On **macOS**: installs an `NSApplicationDelegate` and registers for
-    /// `NSWorkspace` power notifications.  **Must be called from the main thread.**
-    pub fn start() -> Self {
+    /// power notifications according to `config.sleep_monitor_level`.
+    /// **Must be called from the main thread.**
+    pub fn start_with_config(config: SentinelConfig) -> Self {
         let (tx, rx) = common::channel();
 
         #[cfg(all(
@@ -106,6 +144,7 @@ impl Sentinel {
             any(feature = "shutdown", feature = "sleep", feature = "network")
         ))]
         {
+            let _ = config; // unused on Windows
             windows::start(tx);
             Sentinel { rx }
         }
@@ -115,7 +154,7 @@ impl Sentinel {
             any(feature = "shutdown", feature = "sleep", feature = "network")
         ))]
         {
-            let guard = macos::MacosGuard::new(tx);
+            let guard = macos::MacosGuard::new(tx, config);
             Sentinel { rx, _guard: guard }
         }
 
@@ -124,6 +163,7 @@ impl Sentinel {
             any(feature = "shutdown", feature = "sleep", feature = "network")
         )))]
         {
+            let _ = config;
             drop(tx); // unsupported platform or no features — channel returns None immediately
             Sentinel { rx }
         }
