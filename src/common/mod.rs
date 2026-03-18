@@ -6,16 +6,10 @@
 #[cfg(feature = "shutdown")]
 pub(crate) mod shutdown;
 
-#[cfg(feature = "sleep")]
-pub(crate) mod sleep;
-
 // ─── Public re-exports from feature submodules ─────────────────────────────────
 
 #[cfg(feature = "shutdown")]
 pub use shutdown::ShutdownHandle;
-
-#[cfg(feature = "sleep")]
-pub use sleep::{SleepHandle, SleepMonitorLevel};
 
 // ─── SystemEvent ───────────────────────────────────────────────────────────────
 
@@ -28,32 +22,30 @@ pub use sleep::{SleepHandle, SleepMonitorLevel};
 /// 哨兵向应用代码发出的事件，可用变体取决于启用的 feature。
 #[non_exhaustive]
 pub enum SystemEvent {
-    /// The system is about to suspend. Return quickly — very little time available.
+    /// The system is about to enter sleep. Cannot be delayed.
     ///
-    /// **macOS**: `NSWorkspaceWillSleepNotification` (Standard mode only).
+    /// **macOS**: `NSWorkspaceWillSleepNotification`.
     /// **Windows**: `WM_POWERBROADCAST` / `PBT_APMSUSPEND`.
     ///
     /// ---
     ///
-    /// 系统即将挂起，需快速返回。
+    /// 系统即将进入睡眠，无法延迟。
     ///
-    /// **macOS**：`NSWorkspaceWillSleepNotification`（仅 Standard 模式）。
+    /// **macOS**：`NSWorkspaceWillSleepNotification`。
     /// **Windows**：`WM_POWERBROADCAST` / `PBT_APMSUSPEND`。
     #[cfg(feature = "sleep")]
     WillSleep,
 
     /// The system has resumed from suspend.
     ///
-    /// **macOS**: `NSWorkspaceDidWakeNotification` (Standard) or
-    /// `kIOMessageSystemHasPoweredOn` (Deep).
+    /// **macOS**: `NSWorkspaceDidWakeNotification`.
     /// **Windows**: `WM_POWERBROADCAST` / `PBT_APMRESUMESUSPEND`.
     ///
     /// ---
     ///
     /// 系统已从挂起中恢复。
     ///
-    /// **macOS**：`NSWorkspaceDidWakeNotification`（Standard）或
-    /// `kIOMessageSystemHasPoweredOn`（Deep）。
+    /// **macOS**：`NSWorkspaceDidWakeNotification`。
     /// **Windows**：`WM_POWERBROADCAST` / `PBT_APMRESUMESUSPEND`。
     #[cfg(feature = "sleep")]
     DidWake,
@@ -101,24 +93,6 @@ pub enum SystemEvent {
     #[cfg(feature = "shutdown")]
     ShuttingDown(shutdown::ShutdownHandle),
 
-    /// The system is about to enter deep sleep or hibernation.
-    ///
-    /// Call [`SleepHandle::allow`] once pre-sleep work is done. If the handle is
-    /// dropped or the configured `timeout` expires, the OS is unblocked automatically.
-    ///
-    /// **Only emitted on macOS in [`SleepMonitorLevel::Deep`] mode**
-    /// (`kIOMessageSystemWillSleep` via `IORegisterForSystemPower`).
-    ///
-    /// ---
-    ///
-    /// 系统即将深度睡眠或休眠。
-    ///
-    /// 完成睡前工作后调用 [`SleepHandle::allow`]；丢弃句柄或超时后 OS 自动解除阻塞。
-    ///
-    /// **仅在 macOS [`SleepMonitorLevel::Deep`] 模式下发出**
-    /// （通过 `IORegisterForSystemPower` 的 `kIOMessageSystemWillSleep`）。
-    #[cfg(feature = "sleep")]
-    WillHibernate(sleep::SleepHandle),
 }
 
 impl std::fmt::Debug for SystemEvent {
@@ -134,8 +108,6 @@ impl std::fmt::Debug for SystemEvent {
             SystemEvent::NetworkDown     => write!(f, "NetworkDown"),
             #[cfg(feature = "shutdown")]
             SystemEvent::ShuttingDown(_) => write!(f, "ShuttingDown(<handle>)"),
-            #[cfg(feature = "sleep")]
-            SystemEvent::WillHibernate(_) => write!(f, "WillHibernate(<handle>)"),
             #[allow(unreachable_patterns)]
             _ => write!(f, "SystemEvent(<unknown>)"),
         }

@@ -44,9 +44,8 @@ pub struct MacosGuard {
     #[cfg(feature = "shutdown")]
     _delegate: objc2::rc::Retained<shutdown::SentinelDelegate>,
 
-    /// `Some` in Standard mode; `None` in Deep mode (IOKit handles wake events).
     #[cfg(feature = "sleep")]
-    _power_observer: Option<objc2::rc::Retained<sleep::PowerObserver>>,
+    _power_observer: objc2::rc::Retained<sleep::PowerObserver>,
 
     /// Declared after `_power_observer` so `removeObserver:` is called while
     /// `NSNotificationCenter` still holds a strong reference to the observer.
@@ -56,21 +55,11 @@ pub struct MacosGuard {
     /// 在 `_power_observer` 之后声明，确保 `NSNotificationCenter` 仍持有观察者强引用时
     /// 调用 `removeObserver:`。
     #[cfg(feature = "sleep")]
-    _notification_guard: Option<sleep::NotificationObserverGuard>,
+    _notification_guard: sleep::NotificationObserverGuard,
 
     /// Cancels `NWPathMonitor` on drop.
     #[cfg(feature = "network")]
     _path_monitor: network::PathMonitorGuard,
-
-    /// `Some` in Deep mode; `None` in Standard mode.
-    /// Declared last so it drops after the `NSWorkspace` observers above.
-    ///
-    /// ---
-    ///
-    /// Deep 模式下为 `Some`；Standard 模式下为 `None`。
-    /// 最后声明，确保在上方 `NSWorkspace` 观察者之后析构。
-    #[cfg(feature = "sleep")]
-    _iokit_deep_sleep: Option<sleep::IoKitDeepSleepGuard>,
 }
 
 impl MacosGuard {
@@ -79,8 +68,7 @@ impl MacosGuard {
     /// ---
     ///
     /// 安装所有监听器。**必须从主线程调用。**
-    #[allow(unused_variables)] // `config` is consumed by sleep::install when the sleep feature is on
-    pub fn new(event_tx: EventSender, config: crate::SentinelConfig) -> Self {
+    pub fn new(event_tx: EventSender) -> Self {
         #[allow(unused_variables)]
         let mtm = MainThreadMarker::new()
             .expect("onebox_lifecycle: MacosGuard::new() must be called from the main thread");
@@ -95,8 +83,8 @@ impl MacosGuard {
         let _delegate = shutdown::install(mtm, &event_tx);
 
         #[cfg(feature = "sleep")]
-        let (_power_observer, _notification_guard, _iokit_deep_sleep) =
-            sleep::install(mtm, &event_tx, config.sleep_monitor_level);
+        let (_power_observer, _notification_guard) =
+            sleep::install(mtm, &event_tx);
 
         #[cfg(feature = "network")]
         let _path_monitor = network::install(&event_tx);
@@ -110,8 +98,6 @@ impl MacosGuard {
             _notification_guard,
             #[cfg(feature = "network")]
             _path_monitor,
-            #[cfg(feature = "sleep")]
-            _iokit_deep_sleep,
         }
     }
 }

@@ -12,7 +12,7 @@
 //! | Feature    | Windows | macOS |
 //! |------------|---------|-------|
 //! | `shutdown` | `WM_QUERYENDSESSION` + `ShutdownBlockReasonCreate` | `applicationShouldTerminate:` → `NSTerminateLater` |
-//! | `sleep`    | `WM_POWERBROADCAST` | `NSWorkspace` notifications (Standard) or IOKit (Deep) |
+//! | `sleep`    | `WM_POWERBROADCAST` | `NSWorkspace` notifications |
 //! | `network`  | `NotifyNetworkConnectivityHintChange` | `NWPathMonitor` (Network.framework) |
 //!
 //! All three features are enabled by default.
@@ -33,7 +33,7 @@
 //!                 // 执行同步清理，然后允许关机。
 //!                 handle.allow();
 //!             }
-//!             SystemEvent::WillSleep => println!("Going to sleep / 即将睡眠"),
+//!             SystemEvent::WillSleep    => println!("Going to sleep / 即将睡眠"),
 //!             SystemEvent::DidWake   => println!("Woke up / 已唤醒"),
 //!             SystemEvent::NetworkUp   => println!("Network up / 网络可用"),
 //!             SystemEvent::NetworkDown => println!("Network down / 网络不可用"),
@@ -71,9 +71,6 @@ pub(crate) mod common;
 pub use common::{EventReceiver, EventSender, SystemEvent};
 #[cfg(feature = "shutdown")]
 pub use common::ShutdownHandle;
-#[cfg(feature = "sleep")]
-pub use common::{SleepHandle, SleepMonitorLevel};
-
 #[cfg(all(
     target_os = "windows",
     any(feature = "shutdown", feature = "sleep", feature = "network")
@@ -85,48 +82,6 @@ mod windows;
     any(feature = "shutdown", feature = "sleep", feature = "network")
 ))]
 mod macos;
-
-// ─── SentinelConfig ────────────────────────────────────────────────────────────
-
-/// Configuration for [`Sentinel::start_with_config`].
-///
-/// All fields have sensible defaults; [`SentinelConfig::default`] gives the
-/// same behaviour as [`Sentinel::start`].
-///
-/// ---
-///
-/// [`Sentinel::start_with_config`] 的配置。
-///
-/// 所有字段均有合理默认值；[`SentinelConfig::default`] 与 [`Sentinel::start`] 行为一致。
-pub struct SentinelConfig {
-    /// Sleep-monitoring depth on macOS. Ignored on Windows.
-    ///
-    /// - [`SleepMonitorLevel::Standard`] — `NSWorkspace` notifications; no extra
-    ///   thread; no delay capability. **Default.**
-    /// - [`SleepMonitorLevel::Deep`] — IOKit `IORegisterForSystemPower` on a
-    ///   dedicated CFRunLoop thread; emits [`SystemEvent::WillHibernate`] with a
-    ///   [`SleepHandle`] and waits up to `timeout` before allowing sleep.
-    ///
-    /// ---
-    ///
-    /// macOS 上的睡眠监控深度，在 Windows 上忽略。
-    ///
-    /// - [`SleepMonitorLevel::Standard`] — `NSWorkspace` 通知；无额外线程；无法延迟睡眠。**默认值。**
-    /// - [`SleepMonitorLevel::Deep`] — 在独立 CFRunLoop 线程上使用 IOKit
-    ///   `IORegisterForSystemPower`；发出带 [`SleepHandle`] 的
-    ///   [`SystemEvent::WillHibernate`]，最多等待 `timeout` 后允许睡眠。
-    #[cfg(feature = "sleep")]
-    pub sleep_monitor_level: SleepMonitorLevel,
-}
-
-impl Default for SentinelConfig {
-    fn default() -> Self {
-        SentinelConfig {
-            #[cfg(feature = "sleep")]
-            sleep_monitor_level: SleepMonitorLevel::Standard,
-        }
-    }
-}
 
 // ─── Sentinel ──────────────────────────────────────────────────────────────────
 
@@ -146,37 +101,21 @@ pub struct Sentinel {
 }
 
 impl Sentinel {
-    /// Start the sentinel with default configuration.
-    ///
-    /// Equivalent to `Sentinel::start_with_config(SentinelConfig::default())`.
-    ///
-    /// ---
-    ///
-    /// 以默认配置启动哨兵。
-    ///
-    /// 等效于 `Sentinel::start_with_config(SentinelConfig::default())`。
-    pub fn start() -> Self {
-        Self::start_with_config(SentinelConfig::default())
-    }
-
-    /// Start the sentinel with explicit configuration.
-    ///
-    /// **Windows**: spawns a background thread with a hidden Win32 window.
-    /// `config` is currently unused on Windows.
+    /// Start the sentinel.
     ///
     /// **macOS**: installs an `NSApplicationDelegate` and registers power/network
-    /// observers according to `config.sleep_monitor_level`.
-    /// **Must be called from the main thread.**
+    /// observers. **Must be called from the main thread.**
+    ///
+    /// **Windows**: spawns a background thread with a hidden Win32 window.
     ///
     /// ---
     ///
-    /// 以指定配置启动哨兵。
+    /// 启动哨兵。
     ///
-    /// **Windows**：启动带隐藏 Win32 窗口的后台线程，`config` 目前在 Windows 上未使用。
+    /// **macOS**：安装 `NSApplicationDelegate` 并注册电源/网络观察者。**必须从主线程调用。**
     ///
-    /// **macOS**：安装 `NSApplicationDelegate` 并按 `config.sleep_monitor_level`
-    /// 注册电源/网络观察者。**必须从主线程调用。**
-    pub fn start_with_config(config: SentinelConfig) -> Self {
+    /// **Windows**：启动带隐藏 Win32 窗口的后台线程。
+    pub fn start() -> Self {
         let (tx, rx) = common::channel();
 
         #[cfg(all(
@@ -184,7 +123,6 @@ impl Sentinel {
             any(feature = "shutdown", feature = "sleep", feature = "network")
         ))]
         {
-            let _ = config;
             windows::start(tx);
             return Sentinel { rx };
         }
@@ -194,7 +132,7 @@ impl Sentinel {
             any(feature = "shutdown", feature = "sleep", feature = "network")
         ))]
         {
-            let guard = macos::MacosGuard::new(tx, config);
+            let guard = macos::MacosGuard::new(tx);
             return Sentinel { rx, _guard: guard };
         }
 
@@ -203,7 +141,6 @@ impl Sentinel {
             all(target_os = "macos",   any(feature = "shutdown", feature = "sleep", feature = "network")),
         )))]
         {
-            let _ = config;
             drop(tx); // unsupported platform or no features enabled
             Sentinel { rx }
         }
