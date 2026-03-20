@@ -47,9 +47,13 @@ impl ShutdownHandle {
     fn send_inner(&mut self, decision: ShutdownDecision) {
         if let Some(inner) = self.inner.take() {
             match inner {
-                ShutdownHandleInner::Mpsc(tx) => { let _ = tx.send(decision); }
+                ShutdownHandleInner::Mpsc(tx) => {
+                    let _ = tx.send(decision);
+                }
                 #[cfg(feature = "tokio")]
-                ShutdownHandleInner::Tokio(tx) => { let _ = tx.send(decision); }
+                ShutdownHandleInner::Tokio(tx) => {
+                    let _ = tx.send(decision);
+                }
             }
         }
     }
@@ -62,6 +66,10 @@ impl Drop for ShutdownHandle {
     ///
     /// 未显式决策直接丢弃时，默认执行 `Allow`。
     fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
         self.send_inner(ShutdownDecision::Allow);
     }
 }
