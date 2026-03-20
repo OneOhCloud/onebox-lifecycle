@@ -1,6 +1,10 @@
 //! macOS sleep/wake backend — compiled only when the `sleep` feature is enabled.
 //!
 //! Uses `NSWorkspace` notification-centre observers on the main thread.
+//!
+//! When the `shutdown` feature is also enabled, additionally observes
+//! `NSWorkspaceWillPowerOffNotification` to provide an early power-off signal
+//! that fires before `applicationShouldTerminate:`.
 
 use std::sync::Arc;
 
@@ -15,6 +19,19 @@ use crate::common::{EventSender, SystemEvent};
 // Ref: https://developer.apple.com/documentation/appkit/nsworkspace
 const WILL_SLEEP_NOTIFICATION: &str = "NSWorkspaceWillSleepNotification";
 const DID_WAKE_NOTIFICATION:   &str = "NSWorkspaceDidWakeNotification";
+
+/// Posted when the user requests shutdown, restart, or logout.
+/// Fires **before** `applicationShouldTerminate:`, while the system is still
+/// fully operational — ideal for best-effort cleanup.
+///
+/// Ref: <https://developer.apple.com/documentation/appkit/nsworkspace/willpoweroffnotification>
+///
+/// ---
+///
+/// 用户请求关机、重启或注销时发送。在 `applicationShouldTerminate:` 之前触发，
+/// 此时系统仍完全可用——适合执行尽力清理。
+#[cfg(feature = "shutdown")]
+const WILL_POWER_OFF_NOTIFICATION: &str = "NSWorkspaceWillPowerOffNotification";
 
 // ─── PowerObserver (Standard mode) ────────────────────────────────────────────
 
@@ -36,6 +53,18 @@ define_class!(
         #[unsafe(method(handleDidWake:))]
         fn handle_did_wake(&self, _notification: &AnyObject) {
             self.ivars().send(SystemEvent::DidWake);
+        }
+
+        /// Fires when the user initiates system shutdown, restart, or logout.
+        /// This is an early notification — the OS may still cancel the operation.
+        ///
+        /// ---
+        ///
+        /// 用户发起关机、重启或注销时触发。这是一个早期通知——操作系统可能仍会取消操作。
+        #[cfg(feature = "shutdown")]
+        #[unsafe(method(handleWillPowerOff:))]
+        fn handle_will_power_off(&self, _notification: &AnyObject) {
+            self.ivars().send(SystemEvent::WillPowerOff);
         }
     }
 );
@@ -85,13 +114,15 @@ unsafe impl Sync for NotificationObserverGuard {}
 
 // ─── install ───────────────────────────────────────────────────────────────────
 
-/// Register two `NSWorkspace` notification observers for sleep and wake.
+/// Register `NSWorkspace` notification observers for sleep, wake, and
+/// (when the `shutdown` feature is enabled) power-off.
 ///
 /// **Must be called from the main thread.**
 ///
 /// ---
 ///
-/// 注册两个 `NSWorkspace` 通知观察者，监听睡眠与唤醒事件。
+/// 注册 `NSWorkspace` 通知观察者，监听睡眠、唤醒，以及
+/// （当启用 `shutdown` feature 时）关机事件。
 ///
 /// **必须从主线程调用。**
 pub(super) fn install(
@@ -120,6 +151,23 @@ pub(super) fn install(
             name: &*did_wake,
             object: std::ptr::null::<AnyObject>()
         ];
+
+        // When the shutdown feature is enabled, also observe the power-off
+        // notification. This fires *before* applicationShouldTerminate: and
+        // works reliably for all apps including agent/accessory apps.
+        //
+        // 启用 shutdown feature 时，同时监听关机通知。该通知在
+        // applicationShouldTerminate: 之前触发，对所有应用（包括 agent 应用）可靠。
+        #[cfg(feature = "shutdown")]
+        {
+            let will_power_off = NSString::from_str(WILL_POWER_OFF_NOTIFICATION);
+            let _: () = msg_send![nc,
+                addObserver: observer_ptr,
+                selector: objc2::sel!(handleWillPowerOff:),
+                name: &*will_power_off,
+                object: std::ptr::null::<AnyObject>()
+            ];
+        }
 
         NotificationObserverGuard { observer: observer_ptr }
     });

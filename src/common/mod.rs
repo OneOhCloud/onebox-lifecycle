@@ -92,6 +92,30 @@ pub enum SystemEvent {
     #[cfg(feature = "shutdown")]
     ShuttingDown(shutdown::ShutdownHandle),
 
+    /// The user has initiated a system shutdown, restart, or logout.
+    ///
+    /// This is an **early** notification that fires *before* the OS asks apps to
+    /// quit. Unlike [`ShuttingDown`], there is no handle to allow/deny — the OS
+    /// may still cancel the shutdown if the user changes their mind.
+    ///
+    /// Use this to perform best-effort cleanup (e.g. disabling system proxy)
+    /// while the system is still fully operational.
+    ///
+    /// **macOS only**: `NSWorkspaceWillPowerOffNotification`.
+    ///
+    /// ---
+    ///
+    /// 用户已发起系统关机、重启或注销。
+    ///
+    /// 这是一个**早期**通知，在操作系统请求应用退出**之前**触发。
+    /// 与 [`ShuttingDown`] 不同，没有允许/拒绝的 handle——用户仍可能取消关机。
+    ///
+    /// 适合在系统仍完全可用时执行尽力清理（如关闭系统代理）。
+    ///
+    /// **仅 macOS**：`NSWorkspaceWillPowerOffNotification`。
+    #[cfg(feature = "shutdown")]
+    WillPowerOff,
+
 }
 
 impl std::fmt::Debug for SystemEvent {
@@ -107,6 +131,8 @@ impl std::fmt::Debug for SystemEvent {
             SystemEvent::NetworkDown     => write!(f, "NetworkDown"),
             #[cfg(feature = "shutdown")]
             SystemEvent::ShuttingDown(_) => write!(f, "ShuttingDown(<handle>)"),
+            #[cfg(feature = "shutdown")]
+            SystemEvent::WillPowerOff    => write!(f, "WillPowerOff"),
             #[allow(unreachable_patterns)]
             _ => write!(f, "SystemEvent(<unknown>)"),
         }
