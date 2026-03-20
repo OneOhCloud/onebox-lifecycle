@@ -1,6 +1,6 @@
 [package]
 name = "onebox_lifecycle"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 description = "Cross-platform system lifecycle sentinel: shutdown notification, sleep/wake, network events"
 license = "MIT"
