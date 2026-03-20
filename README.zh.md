@@ -1,12 +1,12 @@
 # onebox-lifecycle
 
-跨平台系统生命周期监控库，用 Rust 编写。支持关机阻断、睡眠/唤醒、网络上下线事件。
+跨平台系统生命周期监控库，用 Rust 编写。支持关机通知、睡眠/唤醒、网络上下线事件。
 
 ## 功能矩阵
 
 | 功能 | Windows | macOS |
 |------|---------|-------|
-| 关机阻断 | ✓ `WM_QUERYENDSESSION` + `ShutdownBlockReasonCreate` | ✓ `NSTerminateLater` |
+| 关机通知 | ✓ `WM_QUERYENDSESSION` | ✓ `NSTerminateLater` |
 | 睡眠 / 唤醒 | ✓ `WM_POWERBROADCAST` | ✓ `NSWorkspace` 通知 |
 | 网络上下线 | ✓ `NotifyNetworkConnectivityHintChange` ¹ | ✓ `NWPathMonitor` |
 | 异步清理 | ✓ handle-based，兼容 tokio | ✓ |
@@ -161,9 +161,9 @@ await listen('lifecycle-event', ({ payload }) => {
 });
 ```
 
-> **为什么关机阻断需要 Tauri 而非 CLI？**
+> **为什么关机通知需要 Tauri 而非 CLI？**
 > 纯 CLI 进程没有 `.app` bundle，macOS 不会向其发送 `applicationShouldTerminate:`，
-> 关机时直接 `SIGKILL`，无法阻断或写日志。Tauri 打包为真正的 `.app`，
+> 关机时直接 `SIGKILL`，无法执行清理或写日志。Tauri 打包为真正的 `.app`，
 > macOS 会显示"等待应用程序…"提示并等待 `replyToApplicationShouldTerminate:` 后才继续。
 
 ## 运行演示
@@ -172,7 +172,7 @@ await listen('lifecycle-event', ({ payload }) => {
 # 构建并运行（日志写入 ./onebox_lifecycle_demo.log）
 make run
 
-# 脱离 Terminal 运行（用于测试关机阻断）
+# 脱离 Terminal 运行（用于测试关机通知）
 make run-detached
 make log      # 另开终端查看日志
 make stop     # 结束进程

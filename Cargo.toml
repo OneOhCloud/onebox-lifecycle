@@ -2,7 +2,7 @@
 name = "onebox_lifecycle"
 version = "0.0.3"
 edition = "2024"
-description = "Cross-platform system lifecycle sentinel: shutdown blocking, sleep/wake, network events"
+description = "Cross-platform system lifecycle sentinel: shutdown notification, sleep/wake, network events"
 license = "MIT"
 rust-version = "1.85"
 
@@ -22,7 +22,6 @@ windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Power",
-    "Win32_System_Shutdown",
     "Win32_System_Threading",
     "Win32_NetworkManagement_IpHelper",
     "Win32_Graphics_Gdi",

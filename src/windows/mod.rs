@@ -26,9 +26,6 @@ use windows::{
 };
 
 #[cfg(feature = "shutdown")]
-use std::sync::{Arc, Condvar, Mutex};
-
-#[cfg(feature = "shutdown")]
 use windows::Win32::UI::WindowsAndMessaging::WM_QUERYENDSESSION;
 
 #[cfg(feature = "sleep")]
@@ -76,12 +73,6 @@ const CLASS_NAME: PCWSTR = w!("SysSentinelHidden");
 pub(super) struct WindowState {
     pub(super) event_tx: EventSender,
 
-    #[cfg(feature = "shutdown")]
-    pub(super) pending_shutdown_hwnd: Option<HWND>,
-
-    #[cfg(feature = "shutdown")]
-    pub(super) shutdown_notify: Option<Arc<(Mutex<bool>, Condvar)>>,
-
     /// `None` = not yet delivered.
     #[cfg(feature = "network")]
     pub(super) last_network_up: Option<bool>,
@@ -122,10 +113,6 @@ unsafe fn run_message_loop(event_tx: EventSender) {
         // ── 2. Create a hidden (message-only) window ──────────────────────────
         let state = Box::new(RefCell::new(WindowState {
             event_tx,
-            #[cfg(feature = "shutdown")]
-            pending_shutdown_hwnd: None,
-            #[cfg(feature = "shutdown")]
-            shutdown_notify: None,
             #[cfg(feature = "network")]
             last_network_up: None,
         }));
@@ -211,10 +198,6 @@ unsafe extern "system" fn wndproc(
         // ── Shutdown query ───────────────────────────────────────────────────
         #[cfg(feature = "shutdown")]
         WM_QUERYENDSESSION => shutdown::handle_query(hwnd, state_cell),
-
-        // ── Async cleanup finished ────────────────────────────────────────────
-        #[cfg(feature = "shutdown")]
-        shutdown::WM_SENTINEL_ALLOW_SHUTDOWN => shutdown::handle_allow(state_cell),
 
         // ── Power events ─────────────────────────────────────────────────────
         #[cfg(feature = "sleep")]

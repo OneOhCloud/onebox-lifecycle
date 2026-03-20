@@ -4,7 +4,7 @@
 //!
 //! | Feature            | Windows | macOS |
 //! |--------------------|---------|-------|
-//! | Shutdown blocking  | ✓       | ✓     |
+//! | Shutdown notify     | ✓       | ✓     |
 //! | Sleep / wake       | ✓       | ✓     |
 //! | Network up / down  | ✓       | ✓     |
 //! | Async cleanup      | ✓       | ✓     |
@@ -227,18 +227,16 @@ fn main() {
                 log!("NET↓", "  → Queue outgoing requests; switch to offline mode.");
             }
 
-            // ── Shutdown blocking (async cleanup demo) ────────────────────────
+            // ── Shutdown notification (async cleanup demo) ─────────────────────
             SystemEvent::ShuttingDown(handle) => {
                 log!(
                     "SHUTDOWN",
                     "#{n} Shutdown / restart / logout requested!  (uptime {:.1}s)",
                     uptime.as_secs_f64()
                 );
-                log!("SHUTDOWN", "  → Blocking OS shutdown while async cleanup runs …");
+                log!("SHUTDOWN", "  → Running async cleanup before allowing shutdown …");
 
-                // Tell the OS we need time (Windows: shows a "waiting for <app>" dialog;
-                // macOS: NSTerminateLater suspends the termination sequence).
-                // We spawn an async task that does the real work, then calls handle.allow().
+                // Spawn an async task that does the real work, then calls handle.allow().
                 let counter_clone = Arc::clone(&event_counter);
                 rt.spawn(async move {
                     let cleanup_start = Instant::now();

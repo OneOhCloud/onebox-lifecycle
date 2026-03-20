@@ -87,10 +87,11 @@ define_class!(
             self.ivars().lock().unwrap().event_tx.send(SystemEvent::ShuttingDown(handle));
 
             std::thread::spawn(move || {
-                let decision = decision_rx
+                let _decision = decision_rx
                     .recv_timeout(SHUTDOWN_TIMEOUT)
                     .unwrap_or(ShutdownDecision::Allow);
-                reply_to_should_terminate(matches!(decision, ShutdownDecision::Allow));
+                // Only Allow exists; always proceed with termination.
+                reply_to_should_terminate(true);
             });
 
             NSApplicationTerminateReply::TerminateLater

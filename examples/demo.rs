@@ -23,7 +23,7 @@ fn main() {
             println!("  → Received shutdown request. Simulating 3s of cleanup work…");
 
             // In a real app, spawn an async task here.
-            // For the demo we block this thread.
+            // For the demo we sleep on this thread.
             std::thread::sleep(std::time::Duration::from_secs(3));
 
             println!("  → Cleanup done. Allowing shutdown.");

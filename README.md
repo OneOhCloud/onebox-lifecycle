@@ -1,12 +1,12 @@
 # onebox-lifecycle
 
-Cross-platform system lifecycle monitoring for Rust — shutdown blocking, sleep/wake, and network events.
+Cross-platform system lifecycle monitoring for Rust — shutdown notification, sleep/wake, and network events.
 
 ## Feature matrix
 
 | Feature | Windows | macOS |
 |---------|---------|-------|
-| Shutdown blocking | ✓ `WM_QUERYENDSESSION` + `ShutdownBlockReasonCreate` | ✓ `NSTerminateLater` |
+| Shutdown notification | ✓ `WM_QUERYENDSESSION` | ✓ `NSTerminateLater` |
 | Sleep / wake | ✓ `WM_POWERBROADCAST` | ✓ `NSWorkspace` notifications |
 | Network up / down | ✓ `NotifyNetworkConnectivityHintChange` ¹ | ✓ `NWPathMonitor` |
 | Async cleanup | ✓ handle-based, tokio-compatible | ✓ |
@@ -163,10 +163,10 @@ await listen('lifecycle-event', ({ payload }) => {
 });
 ```
 
-> **Why Tauri instead of a plain CLI for shutdown blocking?**
+> **Why Tauri instead of a plain CLI for shutdown notification?**
 > A bare CLI process has no `.app` bundle. macOS does not send
 > `applicationShouldTerminate:` to it — the process is simply `SIGKILL`ed during
-> shutdown with no opportunity to block or log.  A Tauri app is a proper `.app`
+> shutdown with no opportunity to do cleanup or log.  A Tauri app is a proper `.app`
 > that macOS recognises, shows the "waiting for app…" spinner, and waits for
 > `replyToApplicationShouldTerminate:` before proceeding.
 
@@ -176,7 +176,7 @@ await listen('lifecycle-event', ({ payload }) => {
 # Build and run (log written to ./onebox_lifecycle_demo.log)
 make run
 
-# Run detached from Terminal (required to test shutdown blocking)
+# Run detached from Terminal (required to test shutdown notification)
 make run-detached
 make log      # tail the log in another terminal
 make stop     # kill the background process

@@ -76,20 +76,19 @@ pub enum SystemEvent {
 
     /// The user or system policy has requested shutdown, logout, or restart.
     ///
-    /// Use [`ShutdownHandle::block`] to delay it while doing async cleanup,
-    /// then [`ShutdownHandle::allow`] when ready.
+    /// Call [`ShutdownHandle::allow`] when cleanup is done to let the OS proceed.
     ///
     /// **macOS**: `applicationShouldTerminate:` returning `NSTerminateLater`.
-    /// **Windows**: `WM_QUERYENDSESSION` + `ShutdownBlockReasonCreate`.
+    /// **Windows**: `WM_QUERYENDSESSION`.
     ///
     /// ---
     ///
     /// 用户或系统策略请求关机、注销或重启。
     ///
-    /// 调用 [`ShutdownHandle::block`] 延迟，清理完成后调用 [`ShutdownHandle::allow`]。
+    /// 清理完成后调用 [`ShutdownHandle::allow`] 让操作系统继续。
     ///
     /// **macOS**：`applicationShouldTerminate:` 返回 `NSTerminateLater`。
-    /// **Windows**：`WM_QUERYENDSESSION` + `ShutdownBlockReasonCreate`。
+    /// **Windows**：`WM_QUERYENDSESSION`。
     #[cfg(feature = "shutdown")]
     ShuttingDown(shutdown::ShutdownHandle),
 

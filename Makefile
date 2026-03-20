@@ -24,7 +24,7 @@ release:
 run: debug
 	./$(BINARY)
 
-# Run detached from Terminal — required to test shutdown blocking correctly.
+# Run detached from Terminal — required to test shutdown notification correctly.
 #
 # When running inside Terminal.app, macOS asks Terminal to quit FIRST during
 # shutdown. Terminal then kills its child processes (including this demo) before
@@ -47,7 +47,7 @@ stop:
 	  pkill -f ./$(BINARY) && echo "Stopped." || echo "Not running." ; \
 	fi
 
-# ── launchd agent — best way to test shutdown blocking ───────────────────────
+# ── launchd agent — best way to test shutdown notification ────────────────────
 #
 # A LaunchAgent is NOT a child of Terminal, runs at login, and receives
 # applicationShouldTerminate: cleanly during system shutdown/restart.

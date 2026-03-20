@@ -1,17 +1,17 @@
 //! # onebox_lifecycle
 //!
-//! Cross-platform system lifecycle monitoring: shutdown blocking, sleep/wake,
+//! Cross-platform system lifecycle monitoring: shutdown notification, sleep/wake,
 //! and network up/down events.
 //!
 //! ---
 //!
-//! 跨平台系统生命周期监控：关机阻塞、睡眠/唤醒、网络上下线事件。
+//! 跨平台系统生命周期监控：关机通知、睡眠/唤醒、网络上下线事件。
 //!
 //! ## Feature matrix / Feature 矩阵
 //!
 //! | Feature    | Windows | macOS |
 //! |------------|---------|-------|
-//! | `shutdown` | `WM_QUERYENDSESSION` + `ShutdownBlockReasonCreate` | `applicationShouldTerminate:` → `NSTerminateLater` |
+//! | `shutdown` | `WM_QUERYENDSESSION` | `applicationShouldTerminate:` → `NSTerminateLater` |
 //! | `sleep`    | `WM_POWERBROADCAST` | `NSWorkspace` notifications |
 //! | `network`  | `NotifyNetworkConnectivityHintChange` | `NWPathMonitor` (Network.framework) |
 //!
