@@ -66,10 +66,6 @@ impl Drop for ShutdownHandle {
     ///
     /// 未显式决策直接丢弃时，默认执行 `Allow`。
     fn drop(&mut self) {
-        #[cfg(target_os = "macos")]
-        {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        }
         self.send_inner(ShutdownDecision::Allow);
     }
 }
