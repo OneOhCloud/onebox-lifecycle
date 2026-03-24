@@ -18,8 +18,8 @@ use windows::{
         UI::WindowsAndMessaging::{
             CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DispatchMessageW, GWLP_USERDATA,
             GetMessageW, GetWindowLongPtrW, MSG, RegisterClassExW, SetWindowLongPtrW,
-            TranslateMessage, UnregisterClassW, WM_DESTROY, WM_NCCREATE,
-            WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+            TranslateMessage, UnregisterClassW, WM_DESTROY, WM_NCCREATE, WNDCLASSEXW,
+            WS_EX_TOOLWINDOW, WS_POPUP,
         },
     },
     core::{PCWSTR, w},
@@ -122,8 +122,11 @@ unsafe fn run_message_loop(event_tx: EventSender) {
             WS_EX_TOOLWINDOW, // hidden from taskbar and Alt+Tab
             CLASS_NAME,
             w!("SysSentinel"),
-            WS_POPUP,  // no caption or border; zero size, never shown
-            0, 0, 0, 0,
+            WS_POPUP, // no caption or border; zero size, never shown
+            0,
+            0,
+            0,
+            0,
             None, // top-level — receives WM_POWERBROADCAST & WM_QUERYENDSESSION
             None,
             None,
@@ -136,13 +139,15 @@ unsafe fn run_message_loop(event_tx: EventSender) {
         shutdown::setup();
 
         #[cfg(feature = "network")]
-        let net_notify_handle = network::setup(hwnd);
+        let net_notify_handle: Option<windows::Win32::Foundation::HANDLE> = network::setup(hwnd);
 
         // ── 4. Pump messages ──────────────────────────────────────────────────
         let mut msg = MSG::default();
         loop {
             let ret = GetMessageW(&mut msg, None, 0, 0);
-            if ret.0 == 0 || ret.0 == -1 { break; }
+            if ret.0 == 0 || ret.0 == -1 {
+                break;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -152,8 +157,7 @@ unsafe fn run_message_loop(event_tx: EventSender) {
         network::teardown(net_notify_handle);
 
         // Guard against double-free: WM_DESTROY already zeroes GWLP_USERDATA.
-        let live_ptr =
-            GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut RefCell<WindowState>;
+        let live_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut RefCell<WindowState>;
         if !live_ptr.is_null() {
             drop(Box::from_raw(live_ptr));
         }
@@ -163,20 +167,14 @@ unsafe fn run_message_loop(event_tx: EventSender) {
 
 // ─── Window procedure ──────────────────────────────────────────────────────────
 
-unsafe extern "system" fn wndproc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE {
         let cs = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize) };
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
 
-    let state_ptr =
-        unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut RefCell<WindowState>;
+    let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut RefCell<WindowState>;
 
     if msg == WM_DESTROY {
         if !state_ptr.is_null() {
@@ -204,7 +202,7 @@ unsafe extern "system" fn wndproc(
         WM_POWERBROADCAST => {
             let st = state_cell.borrow();
             match wparam.0 as u32 {
-                PBT_APMSUSPEND       => st.event_tx.send(SystemEvent::WillSleep),
+                PBT_APMSUSPEND => st.event_tx.send(SystemEvent::WillSleep),
                 PBT_APMRESUMESUSPEND => st.event_tx.send(SystemEvent::DidWake),
                 _ => {}
             }
