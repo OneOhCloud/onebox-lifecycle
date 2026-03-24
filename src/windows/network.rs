@@ -4,7 +4,9 @@
 //! connectivity state. The callback is invoked on a system thread and
 //! forwards updates to the hidden sentinel window via `PostMessageW`.
 //!
-//! On older systems (Windows 7 / 8 / 8.1) where the API is unavailable,
+//! **Both APIs are loaded dynamically** (`LoadLibraryW` + `GetProcAddress`) so
+//! the binary has no static import of `iphlpapi!NotifyNetworkConnectivityHintChange`
+//! or `iphlpapi!CancelMibChangeNotify2`. On older systems (Windows 7 / 8 / 8.1)
 //! a warning is printed to stderr and network monitoring is skipped —
 //! no crash, no network events.
 //!
@@ -13,14 +15,16 @@
 //! 使用 `NotifyNetworkConnectivityHintChange`（Windows 10 2004+）追踪 NCSI 连接状态。
 //! 回调在系统线程上触发，通过 `PostMessageW` 将更新转发至隐藏哨兵窗口。
 //!
-//! 在不支持该 API 的旧系统（Windows 7 / 8 / 8.1）上，会向 stderr 输出警告
-//! 并跳过网络监控——不会崩溃，也不会产生网络事件。
+//! **两个 API 均通过动态加载**（`LoadLibraryW` + `GetProcAddress`）获取，二进制
+//! 文件的导入表中不包含对 `iphlpapi!NotifyNetworkConnectivityHintChange` 或
+//! `iphlpapi!CancelMibChangeNotify2` 的静态引用。在不支持该 API 的旧系统
+//! （Windows 7 / 8 / 8.1）上，会向 stderr 输出警告并跳过网络监控——
+//! 不会崩溃，也不会产生网络事件。
 
 use std::cell::RefCell;
 
 use windows::Win32::{
-    Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM},
-    NetworkManagement::IpHelper::{CancelMibChangeNotify2, NotifyNetworkConnectivityHintChange},
+    Foundation::{HANDLE, HWND, LPARAM, LRESULT, WIN32_ERROR, WPARAM},
     Networking::WinSock::{
         NL_NETWORK_CONNECTIVITY_HINT, NetworkConnectivityLevelHintConstrainedInternetAccess,
         NetworkConnectivityLevelHintInternetAccess,
@@ -30,6 +34,28 @@ use windows::Win32::{
 };
 
 use crate::common::SystemEvent;
+
+// ─── Dynamic function signatures ─────────────────────────────────────────────
+//
+// These match the signatures in iphlpapi.dll. Declared as function-pointer
+// types so we can `transmute` the result of `GetProcAddress`.
+
+/// `NotifyNetworkConnectivityHintChange(callback, callercontext, initialnotification, handle) -> WIN32_ERROR`
+type FnNotifyNetworkConnectivityHintChange = unsafe extern "system" fn(
+    callback: Option<
+        unsafe extern "system" fn(
+            callercontext: *const core::ffi::c_void,
+            connectivityhint: NL_NETWORK_CONNECTIVITY_HINT,
+        ),
+    >,
+    callercontext: *const core::ffi::c_void,
+    initialnotification: bool,
+    notificationhandle: *mut HANDLE,
+) -> WIN32_ERROR;
+
+/// `CancelMibChangeNotify2(handle) -> WIN32_ERROR`
+type FnCancelMibChangeNotify2 =
+    unsafe extern "system" fn(notificationhandle: HANDLE) -> WIN32_ERROR;
 
 /// Custom window message: posted by the OS callback to the hidden window.
 ///
@@ -64,19 +90,22 @@ pub(super) const WM_SENTINEL_NETWORK_CHANGE: u32 = WM_APP + 2;
 /// `initialnotification = true` 立即下发当前状态，确保首个真实变更事件触发前
 /// `last_network_up` 已被设置。
 pub(super) fn setup(hwnd: HWND) -> Option<HANDLE> {
-    if !api_available() {
-        eprintln!(
-            "onebox_lifecycle: NotifyNetworkConnectivityHintChange unavailable \
-             (requires Windows 10 2004+) — network monitoring disabled"
-        );
-        return None;
-    }
+    let notify_fn = match load_notify_fn() {
+        Some(f) => f,
+        None => {
+            eprintln!(
+                "onebox_lifecycle: NotifyNetworkConnectivityHintChange unavailable \
+                 (requires Windows 10 2004+) — network monitoring disabled"
+            );
+            return None;
+        }
+    };
 
     let mut handle: HANDLE = unsafe { std::mem::zeroed() };
     unsafe {
-        let _ = NotifyNetworkConnectivityHintChange(
+        let _ = notify_fn(
             Some(net_change_callback),
-            Some(hwnd.0 as *const _), // caller_context = HWND
+            hwnd.0 as *const _, // caller_context = HWND
             true,
             &mut handle,
         );
@@ -86,6 +115,39 @@ pub(super) fn setup(hwnd: HWND) -> Option<HANDLE> {
          (NotifyNetworkConnectivityHintChange)"
     );
     Some(handle)
+}
+
+/// Dynamically load `NotifyNetworkConnectivityHintChange` from `iphlpapi.dll`.
+///
+/// Returns `Some(fn_ptr)` on Windows 10 2004+, `None` on older systems.
+///
+/// ---
+///
+/// 从 `iphlpapi.dll` 动态加载 `NotifyNetworkConnectivityHintChange`。
+///
+/// Windows 10 2004+ 返回 `Some(fn_ptr)`，旧系统返回 `None`。
+fn load_notify_fn() -> Option<FnNotifyNetworkConnectivityHintChange> {
+    unsafe {
+        let lib = LoadLibraryW(windows::core::w!("iphlpapi.dll")).ok()?;
+        let proc = GetProcAddress(
+            lib,
+            windows::core::s!("NotifyNetworkConnectivityHintChange"),
+        )?;
+        Some(std::mem::transmute(proc))
+    }
+}
+
+/// Dynamically load `CancelMibChangeNotify2` from `iphlpapi.dll`.
+///
+/// ---
+///
+/// 从 `iphlpapi.dll` 动态加载 `CancelMibChangeNotify2`。
+fn load_cancel_fn() -> Option<FnCancelMibChangeNotify2> {
+    unsafe {
+        let lib = LoadLibraryW(windows::core::w!("iphlpapi.dll")).ok()?;
+        let proc = GetProcAddress(lib, windows::core::s!("CancelMibChangeNotify2"))?;
+        Some(std::mem::transmute(proc))
+    }
 }
 
 /// Check at runtime whether `iphlpapi.dll` exports
@@ -98,17 +160,9 @@ pub(super) fn setup(hwnd: HWND) -> Option<HANDLE> {
 /// 运行时检查 `iphlpapi.dll` 是否导出 `NotifyNetworkConnectivityHintChange`。
 ///
 /// Windows 10 2004+ 返回 `true`，旧系统返回 `false`。
+#[cfg(test)]
 fn api_available() -> bool {
-    unsafe {
-        let Ok(lib) = LoadLibraryW(windows::core::w!("iphlpapi.dll")) else {
-            return false;
-        };
-        GetProcAddress(
-            lib,
-            windows::core::s!("NotifyNetworkConnectivityHintChange"),
-        )
-        .is_some()
-    }
+    load_notify_fn().is_some()
 }
 
 /// Cancel the notification and release the handle. No-op if `handle` is `None`.
@@ -121,8 +175,10 @@ fn api_available() -> bool {
 /// 取消通知并释放句柄。`handle` 为 `None` 时不做任何操作。
 pub(super) fn teardown(handle: Option<HANDLE>) {
     if let Some(h) = handle {
-        unsafe {
-            let _ = CancelMibChangeNotify2(h);
+        if let Some(cancel_fn) = load_cancel_fn() {
+            unsafe {
+                let _ = cancel_fn(h);
+            }
         }
     }
 }
